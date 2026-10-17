@@ -26,6 +26,8 @@
 #include <ESP8266WebServer.h>
 #include <AccelStepper.h>
 #include <ElegantOTA.h>
+#include <SoftwareSerial.h>
+#include <TMCStepper.h>
 
 // ============================================================
 //  WiFi
@@ -34,7 +36,7 @@
 #include "secrets.h"
 
 // ============================================================
-//  Пины драйверов A4988
+//  Пины драйверов TMC2209 (STEP/DIR/EN — как у A4988)
 // ============================================================
 #define RA_STEP_PIN    4
 #define RA_DIR_PIN     5
@@ -76,6 +78,44 @@ const int   DEC_DIR =  1;
 AccelStepper stepperRA (AccelStepper::DRIVER, RA_STEP_PIN,  RA_DIR_PIN);
 AccelStepper stepperDEC(AccelStepper::DRIVER, DEC_STEP_PIN, DEC_DIR_PIN);
 ESP8266WebServer server(80);
+
+// ============================================================
+//  TMC2209 UART — однопроводная шина на D4 (GPIO2) через 1 кОм
+//  к общему узлу PDN_UART. Адреса: RA = 0, DEC = 1 (MS1/MS2).
+// ============================================================
+#define TMC_UART_PIN   2
+const long  TMC_BAUD       = 57600;   // ≤74880 — асинхронный RX-ISR SoftwareSerial
+const float TMC_RSENSE     = 0.11f;
+const int   RA_CURRENT_MA  = 1190;    // 70% от 1.7 A (JK42HS40-1704)
+const int   DEC_CURRENT_MA = 840;     // 70% от 1.2 A (JK42HS60-1206)
+
+// SoftwareSerial в onewire-режиме сам не переключает пин на передачу —
+// обёртка включает TX на время записи. Пока TX включён, RX выключен,
+// поэтому собственного эха в приёмном буфере нет.
+class OneWireUart : public Stream {
+public:
+    explicit OneWireUart(SoftwareSerial& s) : ss(s) {}
+    size_t write(uint8_t b) override {
+        ss.enableTx(true);
+        size_t n = ss.write(b);
+        ss.enableTx(false);
+        return n;
+    }
+    int available() override { return ss.available(); }
+    int read()      override { return ss.read(); }
+    int peek()      override { return ss.peek(); }
+    void flush()    override {}
+private:
+    SoftwareSerial& ss;
+};
+
+SoftwareSerial tmcSerial;
+OneWireUart    tmcBus(tmcSerial);
+TMC2209Stepper drvRA (&tmcBus, TMC_RSENSE, 0);
+TMC2209Stepper drvDEC(&tmcBus, TMC_RSENSE, 1);
+bool raDrvOk  = false;
+bool decDrvOk = false;
+unsigned long lastTmcCheck = 0;
 
 // ============================================================
 //  Состояние монтировки
@@ -559,6 +599,85 @@ poll();
 )rawliteral";
 
 // ============================================================
+//  TMC2209: настройка и контроль по UART
+// ============================================================
+bool tmcInit(TMC2209Stepper& drv, const char* name, int currentMa) {
+    Serial.printf("TMC %s: ", name);
+    uint8_t conn = drv.test_connection();
+    if (conn != 0) {
+        Serial.printf("нет ответа (код %u)\n", conn);
+        return false;
+    }
+    drv.GSTAT(0b111);              // сброс флагов reset/drv_err/uv_cp
+    drv.pdn_disable(true);         // PDN_UART — только UART, не power-down
+    drv.mstep_reg_select(true);    // микрошаг из регистра, MS1/MS2 — адрес
+    drv.I_scale_analog(false);     // ток задаётся только по UART, VREF игнорируется
+    drv.toff(4);
+    drv.blank_time(24);
+    drv.microsteps(MICROSTEPS);
+    drv.intpol(true);
+    drv.rms_current(currentMa);
+    drv.en_spreadCycle(false);     // StealthChop — тихий режим
+    drv.pwm_autoscale(true);
+
+    uint32_t ds = drv.DRV_STATUS();
+    Serial.printf("OK, версия 0x%02X, микрошаг 1/%u, ток %u мА, IFCNT %u",
+                  drv.version(), drv.microsteps(), drv.rms_current(), drv.IFCNT());
+    if (ds & (1UL << 1))  Serial.print(F(", ПЕРЕГРЕВ"));
+    if (ds & (1UL << 0))  Serial.print(F(", предупреждение о температуре"));
+    if (ds & (0b1111UL << 2)) Serial.print(F(", КЗ обмотки"));
+    if (ds & (0b11UL << 6))   Serial.print(F(", обмотка не подключена"));
+    Serial.println();
+    return drv.microsteps() == MICROSTEPS;
+}
+
+// Раз в 5 с: переподключаем пропавший драйвер (например, 12 В подали
+// позже ESP) и переинициализируем после сброса чипа. Во время
+// движения шину не трогаем — чтение блокирует loop() на пару мс.
+void tmcCheck(TMC2209Stepper& drv, bool& ok, const char* name, int currentMa) {
+    if (ok) {
+        if (drv.test_connection() != 0) {
+            Serial.printf("TMC %s: связь потеряна\n", name);
+            ok = false;
+        } else if (drv.GSTAT() & 0b001) {
+            Serial.printf("TMC %s: был сброс, настраиваю заново\n", name);
+            ok = tmcInit(drv, name, currentMa);
+        }
+    } else if (drv.test_connection() == 0) {   // молча ждём, пока ответит
+        ok = tmcInit(drv, name, currentMa);
+    }
+}
+
+// Диагностика драйвера по сети: GET /tmc. Флаги ola/olb (обмотка не
+// подключена) и cs_actual осмысленны только при работающем моторе.
+String tmcJson(TMC2209Stepper& drv, bool ok) {
+    if (!ok || drv.test_connection() != 0) return "{\"ok\":false}";
+    uint32_t ds = drv.DRV_STATUS();
+    auto flag = [ds](int n) { return (ds >> n) & 1UL ? "true" : "false"; };
+    String j = "{\"ok\":true";
+    j += ",\"enabled\":"   + String(drv.isEnabled() ? "true" : "false");
+    j += ",\"microsteps\":" + String(drv.microsteps());
+    j += ",\"rms_ma\":"    + String(drv.rms_current());
+    j += ",\"cs_actual\":" + String((ds >> 16) & 0x1F);
+    j += ",\"stealth\":"   + String(flag(30));
+    j += ",\"standstill\":" + String(flag(31));
+    j += ",\"ola\":" + String(flag(6)) + ",\"olb\":" + String(flag(7));
+    j += ",\"s2ga\":" + String(flag(2)) + ",\"s2gb\":" + String(flag(3));
+    j += ",\"otpw\":" + String(flag(0)) + ",\"ot\":" + String(flag(1));
+    j += ",\"t120\":" + String(flag(8));
+    j += ",\"sg_result\":" + String(drv.SG_RESULT());
+    j += ",\"ifcnt\":"     + String(drv.IFCNT());
+    j += "}";
+    return j;
+}
+
+void handleTmc() {
+    String j = "{\"ra\":" + tmcJson(drvRA, raDrvOk) +
+               ",\"dec\":" + tmcJson(drvDEC, decDrvOk) + "}";
+    server.send(200, "application/json", j);
+}
+
+// ============================================================
 //  SETUP
 // ============================================================
 void setup() {
@@ -570,6 +689,11 @@ void setup() {
 
     pinMode(RA_ENABLE_PIN,  OUTPUT); digitalWrite(RA_ENABLE_PIN,  HIGH);
     pinMode(DEC_ENABLE_PIN, OUTPUT); digitalWrite(DEC_ENABLE_PIN, HIGH);
+
+    tmcSerial.begin(TMC_BAUD, SWSERIAL_8N1, TMC_UART_PIN, TMC_UART_PIN, false);
+    raDrvOk  = tmcInit(drvRA,  "RA",  RA_CURRENT_MA);
+    decDrvOk = tmcInit(drvDEC, "DEC", DEC_CURRENT_MA);
+    lastTmcCheck = millis();
 
     stepperRA .setMaxSpeed(raMaxSpeed);  stepperRA .setAcceleration(raAccel);
     stepperDEC.setMaxSpeed(decMaxSpeed); stepperDEC.setAcceleration(decAccel);
@@ -607,6 +731,7 @@ void setup() {
     server.on("/motor",    HTTP_GET, handleMotor);
     server.on("/estop",    HTTP_GET, handleEStop);
     server.on("/dec-hold",  HTTP_GET, handleDecHold);
+    server.on("/tmc",      HTTP_GET, handleTmc);
 
     // RTS2 JSON API (Stellarium TelescopeClientJsonRts2)
     server.on("/api/devbytype",  HTTP_GET, rts2_devbytype);
@@ -632,6 +757,13 @@ void loop() {
     ElegantOTA.loop();
 
     const unsigned long now = millis();
+
+    // — Контроль драйверов TMC2209 —
+    if (now - lastTmcCheck > 5000 && !isSlewing && !raMoving && !decMoving) {
+        lastTmcCheck = now;
+        tmcCheck(drvRA,  raDrvOk,  "RA",  RA_CURRENT_MA);
+        tmcCheck(drvDEC, decDrvOk, "DEC", DEC_CURRENT_MA);
+    }
 
     // — Трекинг —
     if (trackingEnabled && now - lastTrackUpdate > 10) {
@@ -705,6 +837,8 @@ void handleStatus() {
     j += "\"parked\":"   + String(sParked)           + ",";
     j += "\"dec_hold\":" + String(sDecHold)          + ",";
     j += "\"ra_speed\":" + String(raSpeedMult, 3)    + ",";
+    j += "\"ra_drv\":"   + String(raDrvOk  ? "true" : "false") + ",";
+    j += "\"dec_drv\":"  + String(decDrvOk ? "true" : "false") + ",";
     j += "\"ip\":\""     + WiFi.localIP().toString() + "\"";
     j += "}";
     server.send(200, "application/json", j);
