@@ -422,7 +422,7 @@ const char* htmlPage = R"rawliteral(
       </div>
       <div class="ibox">
         DEC Hold: мотор удерживает ось после остановки.<br>
-        ⚠ Мотор греется — нужен радиатор на A4988.
+        ⚠ Мотор и драйвер DEC постоянно под током (в покое TMC2209 снижает ток вдвое) — нужен радиатор на драйвере.
       </div>
     </div>
   </div>
@@ -677,6 +677,22 @@ void handleTmc() {
     server.send(200, "application/json", j);
 }
 
+// Поиск неисправности шины: GET /tmc-scan. Уровень линии в покое
+// (0 — узел PDN закорочен на GND) и ответ по каждому адресу 0..3:
+// 0 — ответил, 1 — читается 0xFFFFFFFF, 2 — нет ответа.
+void handleTmcScan() {
+    String j = "{\"line_idle\":" + String(digitalRead(TMC_UART_PIN));
+    for (uint8_t addr = 0; addr < 4; addr++) {
+        TMC2209Stepper probe(&tmcBus, TMC_RSENSE, addr);
+        uint8_t conn = probe.test_connection();
+        j += ",\"addr" + String(addr) + "\":{\"conn\":" + String(conn);
+        if (conn == 0) j += ",\"version\":" + String(probe.version());
+        j += "}";
+    }
+    j += "}";
+    server.send(200, "application/json", j);
+}
+
 // ============================================================
 //  SETUP
 // ============================================================
@@ -732,6 +748,7 @@ void setup() {
     server.on("/estop",    HTTP_GET, handleEStop);
     server.on("/dec-hold",  HTTP_GET, handleDecHold);
     server.on("/tmc",      HTTP_GET, handleTmc);
+    server.on("/tmc-scan", HTTP_GET, handleTmcScan);
 
     // RTS2 JSON API (Stellarium TelescopeClientJsonRts2)
     server.on("/api/devbytype",  HTTP_GET, rts2_devbytype);
