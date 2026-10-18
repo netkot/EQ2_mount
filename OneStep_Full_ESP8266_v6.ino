@@ -361,7 +361,8 @@ void parkMount() {
 // ============================================================
 //  HTML веб-интерфейс
 // ============================================================
-const char* htmlPage = R"rawliteral(
+// Во флеше (PROGMEM): в ОЗУ страница не помещается вместе с копией при отдаче
+const char htmlPage[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -405,6 +406,9 @@ const char* htmlPage = R"rawliteral(
 
     /* ── Сетка ── */
     .g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .help{width:100%;border-collapse:collapse;font-size:13px}
+    .help td{padding:5px 6px;border-top:1px solid rgba(255,255,255,0.08);vertical-align:top}
+    .help td:first-child{white-space:nowrap;color:#e2b96f}
     .g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
     @media(max-width:500px){.g2,.g3{grid-template-columns:1fr}}
 
@@ -493,8 +497,8 @@ const char* htmlPage = R"rawliteral(
   <div class="card card-always">
     <div class="card-body">
       <div class="g2" style="align-items:center;gap:8px">
-        <button id="trackBtn" class="btn-track" onclick="toggleTracking()">▶ Start Tracking</button>
-        <button class="btn-estop" onclick="emergencyStop()">⛔ STOP</button>
+        <button id="trackBtn" class="btn-track" onclick="toggleTracking()" title="Включить/выключить ведение: ось RA вращается со звёздной скоростью, звезда стоит в поле">▶ Start Tracking</button>
+        <button class="btn-estop" onclick="emergencyStop()" title="Аварийная остановка: мгновенно, без торможения; трекинг выключается, мотор RA обесточивается">⛔ STOP</button>
       </div>
       <div style="margin-top:10px">
         <label>Tracking speed: <span id="spdVal">1.00×</span> sidereal</label>
@@ -508,29 +512,29 @@ const char* htmlPage = R"rawliteral(
     <div class="card-body">
       <!-- Внешние стрелки — скорость с ползунка, внутренние — медленно (JOG_FINE) -->
       <div class="dpad">
-        <button class="btn-nav cell-N"
+        <button class="btn-nav cell-N" title="На север (DEC+) со скоростью с ползунка, пока кнопка нажата"
           onmousedown="jog('dec',1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
           ontouchstart="jog('dec',1)" ontouchend="jogStop('dec')">▲<small>N · DEC+</small></button>
-        <button class="btn-nav fine cell-n" title="Медленно"
+        <button class="btn-nav fine cell-n" title="Медленно на север (0.1°/с) — для центрирования"
           onmousedown="jogFine('dec',1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
           ontouchstart="jogFine('dec',1)" ontouchend="jogStop('dec')">▴<small>slow</small></button>
-        <button class="btn-nav cell-W"
+        <button class="btn-nav cell-W" title="На восток (RA+) со скоростью с ползунка, пока кнопка нажата"
           onmousedown="jog('ra',-1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jog('ra',-1)" ontouchend="jogStop('ra')">◄<small>E · RA+</small></button>
-        <button class="btn-nav fine cell-w" title="Медленно"
+        <button class="btn-nav fine cell-w" title="Медленно на запад (0.1°/с) — для центрирования"
           onmousedown="jogFine('ra',-1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jogFine('ra',-1)" ontouchend="jogStop('ra')">◂<small>slow</small></button>
-        <button class="btn-stop cell-C" onclick="stopAll()">■</button>
-        <button class="btn-nav fine cell-e" title="Медленно"
+        <button class="btn-stop cell-C" onclick="stopAll()" title="Остановить всё с торможением: GoTo, джог и трекинг">■</button>
+        <button class="btn-nav fine cell-e" title="Медленно на восток (0.1°/с) — для центрирования"
           onmousedown="jogFine('ra',1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jogFine('ra',1)" ontouchend="jogStop('ra')">▸<small>slow</small></button>
-        <button class="btn-nav cell-E"
+        <button class="btn-nav cell-E" title="На запад (RA−) со скоростью с ползунка, пока кнопка нажата"
           onmousedown="jog('ra',1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jog('ra',1)" ontouchend="jogStop('ra')">►<small>W · RA−</small></button>
-        <button class="btn-nav fine cell-s" title="Медленно"
+        <button class="btn-nav fine cell-s" title="Медленно на юг (0.1°/с) — для центрирования"
           onmousedown="jogFine('dec',-1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
           ontouchstart="jogFine('dec',-1)" ontouchend="jogStop('dec')">▾<small>slow</small></button>
-        <button class="btn-nav cell-D"
+        <button class="btn-nav cell-D" title="На юг (DEC−) со скоростью с ползунка, пока кнопка нажата"
           onmousedown="jog('dec',-1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
           ontouchstart="jog('dec',-1)" ontouchend="jogStop('dec')">▼<small>S · DEC−</small></button>
       </div>
@@ -560,11 +564,11 @@ const char* htmlPage = R"rawliteral(
           <div id="decHint" style="font-size:11px;color:#888;margin-top:2px">= 0.0000°</div>
         </div>
       </div>
-      <button class="btn-goto" onclick="doGoTo()" style="margin-top:8px">🚀 Go To</button>
+      <button class="btn-goto" onclick="doGoTo()" title="Навести трубу на RA/DEC из полей; сторона опоры выбирается так, чтобы противовес был внизу" style="margin-top:8px">🚀 Go To</button>
       <div class="g3">
-        <button class="btn-muted" onclick="setHome()" title="Противовес вниз, труба на полюс">⌂ Set Home</button>
-        <button class="btn-muted" onclick="polarSet()" title="Труба на полюс: Sync на полюс и координаты полюса в поля">✦ Polar Set</button>
-        <button class="btn-muted" onclick="doSync()">⟳ Sync</button>
+        <button class="btn-muted" onclick="setHome()" title="Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее">⌂ Set Home</button>
+        <button class="btn-muted" onclick="polarSet()" title="Как Set Home, плюс подставить в поля текущие координаты полюса">✦ Polar Set</button>
+        <button class="btn-muted" onclick="doSync()" title="Труба смотрит на объект с RA/DEC из полей: привязать координаты к нему (центрировать звезду, потом Sync)">⟳ Sync</button>
       </div>
     </div>
   </div>
@@ -576,12 +580,12 @@ const char* htmlPage = R"rawliteral(
     </div>
     <div class="card-body">
       <div class="g2">
-        <button class="btn-warn" onclick="doPark()">Park</button>
-        <button class="btn-muted" onclick="doUnpark()">Unpark</button>
+        <button class="btn-warn" onclick="doPark()" title="Выключить трекинг и увести трубу в дом (противовес вниз, труба на полюс)">Park</button>
+        <button class="btn-muted" onclick="doUnpark()" title="Снять отметку «запаркована» — разрешить GoTo из планетариев">Unpark</button>
       </div>
       <div style="display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap">
         <label class="tog">
-          <input type="checkbox" id="decHoldChk" onchange="setDecHold(this.checked)" checked>
+          <input type="checkbox" id="decHoldChk" onchange="setDecHold(this.checked)" title="Держать мотор DEC под током после остановки, чтобы ось не проседала" checked>
           <span class="tog-sl"></span>
         </label>
         <span id="decHoldLabel" style="font-size:.95em;font-weight:600;color:#10b981">
@@ -620,8 +624,8 @@ const char* htmlPage = R"rawliteral(
         </div>
       </div>
       <div class="g2" style="margin-top:8px">
-        <button class="btn-muted" onclick="applyMotor('ra')">Apply RA</button>
-        <button class="btn-muted" onclick="applyMotor('dec')">Apply DEC</button>
+        <button class="btn-muted" onclick="applyMotor('ra')" title="Применить макс. скорость и ускорение RA (до перезагрузки)">Apply RA</button>
+        <button class="btn-muted" onclick="applyMotor('dec')" title="Применить макс. скорость и ускорение DEC (до перезагрузки)">Apply DEC</button>
       </div>
     </div>
   </div>
@@ -645,6 +649,32 @@ const char* htmlPage = R"rawliteral(
     </div>
   </div>
 
+  <!-- ═══ Справка по кнопкам (раскрываемая) ═══════════════════════ -->
+  <div class="card">
+    <div class="card-hdr" onclick="tog(this)">
+      <h2>❓ Справка по кнопкам</h2><span class="arr">▼</span>
+    </div>
+    <div class="card-body">
+      <table class="help">
+        <tr><td><b>▶ Start Tracking</b></td><td>Включить/выключить ведение: ось RA вращается со звёздной скоростью, звезда стоит в поле</td></tr>
+        <tr><td><b>⛔ STOP</b></td><td>Аварийная остановка: мгновенно, без торможения; трекинг выключается, мотор RA обесточивается</td></tr>
+        <tr><td><b>■</b></td><td>Остановить всё с торможением: GoTo, джог и трекинг</td></tr>
+        <tr><td><b>▲ ▼ ◄ ►</b></td><td>Движение по N/S/E/W со скоростью с ползунка, пока кнопка нажата</td></tr>
+        <tr><td><b>▴ ▾ ◂ ▸ (slow)</b></td><td>Медленное движение 0.1°/с — для центрирования звезды</td></tr>
+        <tr><td><b>🚀 Go To</b></td><td>Навести трубу на RA/DEC из полей; сторона опоры выбирается так, чтобы противовес был внизу</td></tr>
+        <tr><td><b>⌂ Set Home</b></td><td>Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее</td></tr>
+        <tr><td><b>✦ Polar Set</b></td><td>Как Set Home, плюс подставить в поля текущие координаты полюса</td></tr>
+        <tr><td><b>⟳ Sync</b></td><td>Труба смотрит на объект с RA/DEC из полей: привязать координаты к нему (центрировать звезду, потом Sync)</td></tr>
+        <tr><td><b>Park</b></td><td>Выключить трекинг и увести трубу в дом (противовес вниз, труба на полюс)</td></tr>
+        <tr><td><b>Unpark</b></td><td>Снять отметку «запаркована» — разрешить GoTo из планетариев</td></tr>
+        <tr><td><b>DEC Hold</b></td><td>Держать мотор DEC под током после остановки, чтобы ось не проседала</td></tr>
+        <tr><td><b>Apply RA / DEC</b></td><td>Применить макс. скорость и ускорение оси (до перезагрузки)</td></tr>
+        <tr><td><b>Open Update Page</b></td><td>Открыть страницу загрузки новой прошивки по WiFi</td></tr>
+      </table>
+      <p style="font-size:11px;color:#888;margin-top:6px">На компьютере то же пояснение всплывает при наведении на кнопку.</p>
+    </div>
+  </div>
+
   <!-- ═══ OTA Update (раскрываемая) ════════════════════════════════ -->
   <div class="card">
     <div class="card-hdr" onclick="tog(this)">
@@ -654,7 +684,7 @@ const char* htmlPage = R"rawliteral(
       <div class="ibox" style="margin-top:0;margin-bottom:8px">
         Version: <b>6.0</b> &nbsp;|&nbsp; <span class="dot dot-g"></span>Ready
       </div>
-      <button class="btn-muted" onclick="window.open('/update','_blank')">Open Update Page</button>
+      <button class="btn-muted" onclick="window.open('/update','_blank')" title="Открыть страницу загрузки новой прошивки по WiFi">Open Update Page</button>
       <p style="font-size:11px;color:#666;margin-top:6px">⚠ Do not disconnect power during update!</p>
     </div>
   </div>
@@ -969,7 +999,7 @@ void setup() {
     }
 
     // Web UI маршруты
-    server.on("/",         HTTP_GET, []{ server.send(200,"text/html",htmlPage); });
+    server.on("/",         HTTP_GET, []{ server.send_P(200, "text/html", htmlPage); });
     server.on("/status",   HTTP_GET, handleStatus);
     server.on("/tracking", HTTP_GET, handleTracking);
     server.on("/ra-speed", HTTP_GET, handleRASpeed);
