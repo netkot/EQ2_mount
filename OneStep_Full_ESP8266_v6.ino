@@ -405,7 +405,8 @@ const char* htmlPage = R"rawliteral(
 
     /* ── Сетка ── */
     .g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-    @media(max-width:500px){.g2{grid-template-columns:1fr}}
+    .g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+    @media(max-width:500px){.g2,.g3{grid-template-columns:1fr}}
 
     /* ── Координаты ── */
     .coord-box{background:rgba(0,0,0,0.3);border-radius:7px;
@@ -546,8 +547,9 @@ const char* htmlPage = R"rawliteral(
         </div>
       </div>
       <button class="btn-goto" onclick="doGoTo()" style="margin-top:8px">🚀 Go To</button>
-      <div class="g2">
+      <div class="g3">
         <button class="btn-muted" onclick="setHome()" title="Противовес вниз, труба на полюс">⌂ Set Home</button>
+        <button class="btn-muted" onclick="polarSet()" title="Труба на полюс: Sync на полюс и координаты полюса в поля">✦ Polar Set</button>
         <button class="btn-muted" onclick="doSync()">⟳ Sync</button>
       </div>
     </div>
@@ -753,6 +755,17 @@ function doGoTo(){
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
 function setHome(){fetch('/set-home').then(poll);}
+/* Труба на полюсе (противовес вниз): то же положение, что Set Home,
+   плюс текущие координаты полюса в поля GoTo/Sync. Планетарии увидят
+   новую позицию при следующем опросе (:GR#/:GD#, /api/get). */
+function polarSet(){
+  fetch('/set-home').then(()=>fetch('/status')).then(r=>r.json()).then(d=>{
+    document.getElementById('gotoRA').value=hms(d.ra_deg);
+    document.getElementById('gotoDEC').value='+90 00 00';
+    raHint(); decHint(); poll();
+    if(!d.time_ok)alert('Время не задано — RA полюса будет неверным');
+  });
+}
 function doSync(){
   var ra=raDeg(), dec=decDeg(); if(ra===null||dec===null)return;
   fetch('/sync?ra='+ra+'&dec='+dec)
