@@ -20,6 +20,9 @@
 //    • :GT# → "60.1642#" когда трекинг включён, "0.0000#" иначе
 //    • :D#  → "\x7f#" / "#" (per spec "\0x7f#")
 //    • DEC мотор не отключается после остановки (держит ось)
+//
+//  v6.1: модель координат RA = LST − HA (NTP), стороны опоры,
+//        GoTo с доводкой, трекинг/джог отделены от run() — см. README
 // ============================================================
 
 #include <ESP8266WiFi.h>
@@ -28,6 +31,9 @@
 #include <ElegantOTA.h>
 #include <SoftwareSerial.h>
 #include <TMCStepper.h>
+#include <time.h>
+#include <sys/time.h>
+#include <coredecls.h>
 
 // ============================================================
 //  WiFi
@@ -54,8 +60,8 @@ const int   STEPS_PER_REV  = 200 * MICROSTEPS;   // 3200 шаг/об
 
 // DEC: шестерни 2×10 = 1:5
 const float DEC_GEAR_RATIO  = 5.0f;
-const long  DEC_STEPS_PER_DEG =
-    (long)((STEPS_PER_REV * DEC_GEAR_RATIO) / 360.0f);   // 44
+const double DEC_STEPS_PER_DEG =
+    (STEPS_PER_REV * DEC_GEAR_RATIO) / 360.0;   // 44.444 (не округлять — 1% ошибки)
 
 // RA: ремень GT2 16→80 (×5) + червяк EQ2 (×144) = 1:720
 const float RA_BELT_RATIO  = 80.0f / 16.0f;
@@ -71,6 +77,13 @@ const float RA_SIDEREAL_SPEED = SIDEREAL_RATE * RA_STEPS_PER_DEG;
 // Инверсия направления (поменяйте знак если крутит не туда)
 const int   RA_DIR  =  1;
 const int   DEC_DIR =  1;
+
+// Механический часовой угол оси RA в домашнем положении (противовес вниз,
+// труба на полюс), градусы. −90: из дома DEC− опускает трубу на восток,
+// +90 — на запад. На монтировке проверено: восток.
+const double HOME_HA_DEG  = -90.0;
+// GoTo ниже этой высоты над горизонтом не выполняется, градусы
+const double GOTO_MIN_ALT = 0.0;
 
 // ============================================================
 //  Объекты
@@ -126,8 +139,17 @@ float  raManualSpeed   = 0.0f;    // °/сек, ручное RA
 float  decManualSpeed  = 0.0f;    // °/сек, ручное DEC
 bool   isParked        = false;
 bool   isSlewing       = false;
+bool   raSlew          = false;   // ось RA идёт по moveTo()/run()
+bool   decSlew         = false;   // ось DEC идёт по moveTo()/run()
+bool   gotoPending     = false;   // GoTo ждёт доводки по RA
+int    gotoPass        = 0;
 
-// Координаты J2000, градусы
+// Источник времени: 0 — не задано, 1 — вручную (браузер/LX200), 2 — NTP
+uint8_t timeSource     = 0;
+double  lxUtcOffsetH   = 0.0;     // LX200 :SG — сколько часов прибавить к местному, чтобы получить UTC
+long    lxLocalSecs    = -1;      // LX200 :SL — местное время, с от полуночи
+
+// Координаты на эпоху даты (RA = LST − HA), градусы
 double currentRA_deg  = 0.0;     // 0..360
 double currentDEC_deg = 0.0;     // -90..+90
 double targetRA_deg   = 0.0;
@@ -182,31 +204,158 @@ bool  lxHighPrecision = true;          // true = HH:MM:SS / +DD*MM:SS
 //  Вспомогательные функции
 // ============================================================
 
+double wrap360(double a) { a = fmod(a, 360.0); return a < 0.0 ? a + 360.0 : a; }
+double wrap180(double a) { return wrap360(a + 180.0) - 180.0; }
+
+double unixTimeNow() {
+    timeval tv;
+    gettimeofday(&tv, nullptr);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
+void setClock(double unixSec, uint8_t src) {
+    timeval tv;
+    tv.tv_sec  = (time_t)unixSec;
+    tv.tv_usec = (suseconds_t)((unixSec - floor(unixSec)) * 1e6);
+    settimeofday(&tv, nullptr);
+    timeSource = src;
+    Serial.printf("Time set (%s): %.0f\n", src == 2 ? "NTP" : "manual", unixSec);
+}
+
+// Местное звёздное время, градусы (GMST, без нутации — ошибка < 1″ времени)
+double lstDeg() {
+    double d = (unixTimeNow() - 946728000.0) / 86400.0;   // сутки от J2000.0
+    return wrap360(280.46061837 + 360.98564736629 * d + obsLongitude_deg);
+}
+
+// Механические углы осей. RA: часовой угол, растёт на запад (по трекингу).
+// DEC: 90 — труба на полюс, больше 90 — ось перешла за полюс.
+double mechHA()  { return stepperRA .currentPosition() / (double)(RA_STEPS_PER_DEG * RA_DIR); }
+double mechDEC() { return stepperDEC.currentPosition() / (DEC_STEPS_PER_DEG * DEC_DIR); }
+
+// За полюсом труба на другой стороне опоры: HA = h + 180°, DEC = 180° − d
+bool pierFlipped(double d) { return d > 90.0; }
+
+void mechToEq(double h, double d, double& ra, double& dec) {
+    double ha = h;
+    dec = d;
+    if (pierFlipped(d)) { ha += 180.0; dec = 180.0 - d; }
+    ra = wrap360(lstDeg() - ha);
+}
+
+// Механическая позиция для (RA, DEC) на нужной стороне опоры;
+// h берётся ближайшим к refH (без лишних оборотов оси)
+void eqToMech(double ra, double dec, bool flip, double refH, double& h, double& d) {
+    double ha = lstDeg() - ra;
+    d = dec;
+    if (flip) { ha += 180.0; d = 180.0 - dec; }
+    h = refH + wrap180(ha - refH);
+}
+
+void altAz(double ra, double dec, double& alt, double& az) {
+    double ha = (lstDeg() - ra) * DEG_TO_RAD;
+    double de = dec * DEG_TO_RAD, la = obsLatitude_deg * DEG_TO_RAD;
+    alt = asin(sin(de)*sin(la) + cos(de)*cos(la)*cos(ha)) * RAD_TO_DEG;
+    az  = wrap360(atan2(-cos(de)*sin(ha),
+                        sin(de)*cos(la) - cos(de)*sin(la)*cos(ha)) * RAD_TO_DEG);
+}
+
 void updateCurrentCoords() {
-    double rawRA = stepperRA.currentPosition()
-                   / (double)(RA_STEPS_PER_DEG * RA_DIR);
-    rawRA = fmod(rawRA, 360.0);
-    if (rawRA < 0.0) rawRA += 360.0;
-    currentRA_deg  = rawRA;
-    currentDEC_deg = stepperDEC.currentPosition()
-                     / (double)(DEC_STEPS_PER_DEG * DEC_DIR);
+    mechToEq(mechHA(), mechDEC(), currentRA_deg, currentDEC_deg);
 }
 
 void enableRA (bool on) { digitalWrite(RA_ENABLE_PIN,  on ? LOW : HIGH); }
 void enableDEC(bool on) { digitalWrite(DEC_ENABLE_PIN, on ? LOW : HIGH); }
 
-void startGoTo(double ra_deg, double dec_deg) {
-    long raSteps  = (long)(ra_deg  * RA_STEPS_PER_DEG  * RA_DIR);
-    long decSteps = (long)(dec_deg * DEC_STEPS_PER_DEG * DEC_DIR);
+void startSlewMech(double h, double d) {
+    raManualSpeed = decManualSpeed = 0;
     enableRA(true);
     enableDEC(true);
-    stepperRA .moveTo(raSteps);
-    stepperDEC.moveTo(decSteps);
-    raMoving  = true;
-    decMoving = true;
+    stepperRA .setSpeed(0);
+    stepperDEC.setSpeed(0);
+    stepperRA .moveTo(lround(h * RA_STEPS_PER_DEG  * RA_DIR));
+    stepperDEC.moveTo(lround(d * DEC_STEPS_PER_DEG * DEC_DIR));
+    raSlew = decSlew = true;
+    raMoving = decMoving = true;
     isSlewing = true;
     isParked  = false;
-    Serial.printf("GoTo: RA=%.4f° DEC=%.4f°\n", ra_deg, dec_deg);
+}
+
+// GoTo по RA/DEC. Сторона опоры — та, где противовес ниже оси RA
+// (|h − HOME_HA_DEG| ≤ 90°). false — время не задано или цель ниже GOTO_MIN_ALT.
+bool startGoTo(double ra_deg, double dec_deg) {
+    if (!timeSource) {
+        Serial.println(F("GoTo refused: time not set"));
+        return false;
+    }
+    double alt, az;
+    altAz(ra_deg, dec_deg, alt, az);
+    if (alt < GOTO_MIN_ALT) {
+        Serial.printf("GoTo refused: RA=%.4f° DEC=%.4f° alt=%.1f°\n", ra_deg, dec_deg, alt);
+        return false;
+    }
+    targetRA_deg  = ra_deg;
+    targetDEC_deg = dec_deg;
+    double h, d, hf, df;
+    eqToMech(ra_deg, dec_deg, false, HOME_HA_DEG, h,  d);
+    eqToMech(ra_deg, dec_deg, true,  HOME_HA_DEG, hf, df);
+    if (fabs(hf - HOME_HA_DEG) < fabs(h - HOME_HA_DEG)) { h = hf; d = df; }
+    startSlewMech(h, d);
+    gotoPending = true;
+    gotoPass    = 0;
+    Serial.printf("GoTo: RA=%.4f° DEC=%.4f° → HA mech=%.4f° DEC mech=%.4f°\n",
+                  ra_deg, dec_deg, h, d);
+    return true;
+}
+
+// Плавная остановка GoTo (с торможением)
+void haltSlew() {
+    gotoPending = false;
+    if (raSlew)  stepperRA .stop();
+    if (decSlew) stepperDEC.stop();
+}
+
+// Мгновенная остановка: сброс скорости и цели
+void abortSlew() {
+    gotoPending = false;
+    raSlew = decSlew = false;
+    stepperRA .setCurrentPosition(stepperRA .currentPosition());
+    stepperDEC.setCurrentPosition(stepperDEC.currentPosition());
+}
+
+// Sync: монтировка смотрит на (RA, DEC). Сторона опоры — ближайшая к текущей.
+// false — время не задано (без LST привязка RA бессмысленна).
+bool syncTo(double ra_deg, double dec_deg) {
+    if (!timeSource) {
+        Serial.println(F("Sync refused: time not set"));
+        return false;
+    }
+    double h = mechHA(), d = mechDEC();
+    double h1, d1, h2, d2;
+    eqToMech(ra_deg, dec_deg, false, h, h1, d1);
+    eqToMech(ra_deg, dec_deg, true,  h, h2, d2);
+    if (fabs(h2 - h) + fabs(d2 - d) < fabs(h1 - h) + fabs(d1 - d)) { h1 = h2; d1 = d2; }
+    abortSlew();
+    stepperRA .setCurrentPosition(lround(h1 * RA_STEPS_PER_DEG  * RA_DIR));
+    stepperDEC.setCurrentPosition(lround(d1 * DEC_STEPS_PER_DEG * DEC_DIR));
+    Serial.printf("Sync → RA=%.4f° DEC=%.4f° (HA mech=%.4f° DEC mech=%.4f°)\n",
+                  ra_deg, dec_deg, h1, d1);
+    return true;
+}
+
+// Домашнее положение: противовес вниз, труба на полюс
+void setHomePosition() {
+    abortSlew();
+    stepperRA .setCurrentPosition(lround(HOME_HA_DEG * RA_STEPS_PER_DEG  * RA_DIR));
+    stepperDEC.setCurrentPosition(lround(90.0        * DEC_STEPS_PER_DEG * DEC_DIR));
+    Serial.println(F("Home set (pole, counterweight down)"));
+}
+
+void parkMount() {
+    trackingEnabled = false;
+    gotoPending     = false;
+    startSlewMech(HOME_HA_DEG, 90.0);
+    isParked = true;
 }
 
 // ============================================================
@@ -358,17 +507,17 @@ const char* htmlPage = R"rawliteral(
       <div class="dpad">
         <button class="btn-nav cell-N"
           onmousedown="jog('dec',1)" onmouseup="jogStop('dec')"
-          ontouchstart="jog('dec',1)" ontouchend="jogStop('dec')">▲<small>DEC+</small></button>
+          ontouchstart="jog('dec',1)" ontouchend="jogStop('dec')">▲<small>N · DEC+</small></button>
         <button class="btn-nav cell-W"
           onmousedown="jog('ra',-1)" onmouseup="jogStop('ra')"
-          ontouchstart="jog('ra',-1)" ontouchend="jogStop('ra')">◄<small>RA−</small></button>
+          ontouchstart="jog('ra',-1)" ontouchend="jogStop('ra')">◄<small>E · RA+</small></button>
         <button class="btn-stop cell-C" onclick="stopAll()">■</button>
         <button class="btn-nav cell-E"
           onmousedown="jog('ra',1)" onmouseup="jogStop('ra')"
-          ontouchstart="jog('ra',1)" ontouchend="jogStop('ra')">►<small>RA+</small></button>
+          ontouchstart="jog('ra',1)" ontouchend="jogStop('ra')">►<small>W · RA−</small></button>
         <button class="btn-nav cell-D"
           onmousedown="jog('dec',-1)" onmouseup="jogStop('dec')"
-          ontouchstart="jog('dec',-1)" ontouchend="jogStop('dec')">▼<small>DEC−</small></button>
+          ontouchstart="jog('dec',-1)" ontouchend="jogStop('dec')">▼<small>S · DEC−</small></button>
       </div>
       <div style="margin-top:10px">
         <label>Jog speed: <span id="jogVal">14</span> °/s</label>
@@ -396,7 +545,7 @@ const char* htmlPage = R"rawliteral(
       </div>
       <button class="btn-goto" onclick="doGoTo()" style="margin-top:8px">🚀 Go To</button>
       <div class="g2">
-        <button class="btn-muted" onclick="setHome()">⌂ Set Home</button>
+        <button class="btn-muted" onclick="setHome()" title="Противовес вниз, труба на полюс">⌂ Set Home</button>
         <button class="btn-muted" onclick="doSync()">⟳ Sync</button>
       </div>
     </div>
@@ -495,8 +644,10 @@ const char* htmlPage = R"rawliteral(
 </div><!-- /container -->
 
 <script>
-var trackOn=false;
+var trackOn=false, timeSent=false;
 function fmt(v,d){return Number(v).toFixed(d||4);}
+function hms(deg){var s=Math.round(((deg%360+360)%360)/15*3600)%86400;
+  return [s/3600|0,(s/60|0)%60,s%60].map(x=>('0'+x).slice(-2)).join(':');}
 
 /* ── Раскрытие секций ── */
 function tog(hdr){
@@ -512,7 +663,11 @@ function poll(){
     document.getElementById('statusBox').innerHTML=
       '<b>Tracking:</b> '+(d.tracking?'<span style="color:#10b981">ON</span>':'OFF')+
       ' &nbsp;|&nbsp; <b>Slewing:</b> '+(d.slewing?'<span style="color:#f59e0b">YES</span>':'NO')+
-      ' &nbsp;|&nbsp; <b>Parked:</b> '+(d.parked?'<span style="color:#60a5fa">YES</span>':'NO');
+      ' &nbsp;|&nbsp; <b>Parked:</b> '+(d.parked?'<span style="color:#60a5fa">YES</span>':'NO')+
+      '<br><b>LST:</b> '+hms(d.lst)+' &nbsp;|&nbsp; <b>Alt:</b> '+fmt(d.alt,1)+'°'+
+      ' &nbsp;|&nbsp; <b>Pier:</b> '+d.pier+
+      (d.time_ok?'':' &nbsp;|&nbsp; <span style="color:#f59e0b">⚠ время не задано</span>');
+    if(!d.time_ok&&!timeSent){timeSent=true;fetch('/set-time?ms='+Date.now());}
     if(d.ip){
       var u='http://'+d.ip+'/';
       document.getElementById('rts2url').innerText=u;
@@ -549,12 +704,14 @@ function stopAll(){fetch('/stop-all').then(poll);}
 /* ── GoTo ── */
 function doGoTo(){
   fetch('/goto?ra='+document.getElementById('gotoRA').value+
-              '&dec='+document.getElementById('gotoDEC').value).then(poll);
+              '&dec='+document.getElementById('gotoDEC').value)
+    .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
 function setHome(){fetch('/set-home').then(poll);}
 function doSync(){
   fetch('/sync?ra='+document.getElementById('gotoRA').value+
-              '&dec='+document.getElementById('gotoDEC').value).then(poll);
+              '&dec='+document.getElementById('gotoDEC').value)
+    .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
 
 /* ── Park ── */
@@ -714,6 +871,7 @@ void setup() {
 
     stepperRA .setMaxSpeed(raMaxSpeed);  stepperRA .setAcceleration(raAccel);
     stepperDEC.setMaxSpeed(decMaxSpeed); stepperDEC.setAcceleration(decAccel);
+    setHomePosition();   // после включения монтировка считается в доме
 
     WiFi.begin(ssid, password);
     Serial.print(F("WiFi connecting"));
@@ -727,6 +885,8 @@ void setup() {
         Serial.println("RTS2:     http://" + WiFi.localIP().toString() + "/api/...");
         Serial.println("LX200:    " + WiFi.localIP().toString() + ":4030");
         Serial.println("OTA:      http://" + WiFi.localIP().toString() + "/update");
+        settimeofday_cb([](bool fromSntp) { if (fromSntp) timeSource = 2; });
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
     } else {
         Serial.println(F("\nWiFi failed — AP mode: EQ2-Mount / telescope"));
         WiFi.softAP("EQ2-Mount", "telescope");
@@ -743,6 +903,7 @@ void setup() {
     server.on("/goto",     HTTP_GET, handleGoTo);
     server.on("/sync",     HTTP_GET, handleSync);
     server.on("/set-home", HTTP_GET, handleSetHome);
+    server.on("/set-time", HTTP_GET, handleSetTime);
     server.on("/park",     HTTP_GET, handlePark);
     server.on("/unpark",   HTTP_GET, handleUnpark);
     server.on("/motor",    HTTP_GET, handleMotor);
@@ -783,53 +944,51 @@ void loop() {
         tmcCheck(drvDEC, decDrvOk, "DEC", DEC_CURRENT_MA);
     }
 
-    // — Трекинг —
-    if (trackingEnabled && now - lastTrackUpdate > 10) {
-        stepperRA.setSpeed(RA_SIDEREAL_SPEED * raSpeedMult * RA_DIR);
-        stepperRA.runSpeed();
-        raMoving   = true;
+    // — RA: GoTo (run() с разгоном) или постоянная скорость (трекинг + джог) —
+    if (raSlew) {
+        if (!stepperRA.run()) raSlew = false;
         raStopTime = now;
-        lastTrackUpdate = now;
-    }
-
-    // — Ручное управление —
-    if (raManualSpeed != 0.0f) {
-        stepperRA.setSpeed(raManualSpeed * RA_STEPS_PER_DEG * RA_DIR);
-        stepperRA.runSpeed();
-        raMoving = true; raStopTime = now;
-    }
-    if (decManualSpeed != 0.0f) {
-        stepperDEC.setSpeed(decManualSpeed * DEC_STEPS_PER_DEG * DEC_DIR);
-        stepperDEC.runSpeed();
-        decMoving = true; decStopTime = now;
-    }
-
-    // — GoTo RA —
-    if (stepperRA.distanceToGo() != 0) {
-        stepperRA.run();
-        raMoving = true; raStopTime = now; isSlewing = true;
-    } else if (raMoving && !trackingEnabled && raManualSpeed == 0.0f) {
-        if (now - raStopTime > MOTOR_OFF_DELAY) {
+    } else {
+        float sps = raManualSpeed * RA_STEPS_PER_DEG * RA_DIR;
+        if (trackingEnabled) sps += RA_SIDEREAL_SPEED * raSpeedMult * RA_DIR;
+        if (sps != 0.0f) {
+            enableRA(true);
+            stepperRA.setSpeed(sps);
+            stepperRA.runSpeed();
+            raMoving = true; raStopTime = now;
+        } else if (raMoving && now - raStopTime > MOTOR_OFF_DELAY) {
             enableRA(false); raMoving = false;
         }
     }
 
-    // — GoTo DEC — мотор DEC не выключаем (держит ось) —
-    if (stepperDEC.distanceToGo() != 0) {
-        stepperDEC.run();
-        decMoving = true; decStopTime = now; isSlewing = true;
-    } else if (decMoving && decManualSpeed == 0.0f) {
-        if (now - decStopTime > MOTOR_OFF_DELAY) {
-            decMoving = false;
-            if (!decHoldEnabled) {
-                enableDEC(false);   // отключаем только если hold выключен
-            }
-            // если decHoldEnabled=true — мотор остаётся включённым, держит ось
+    // — DEC: GoTo или джог. Джог по небу (север +), за полюсом механика наоборот.
+    //   Мотор DEC после остановки не выключаем, если включено удержание —
+    if (decSlew) {
+        if (!stepperDEC.run()) decSlew = false;
+        decStopTime = now;
+    } else if (decManualSpeed != 0.0f) {
+        float sky = pierFlipped(mechDEC()) ? -1.0f : 1.0f;
+        enableDEC(true);
+        stepperDEC.setSpeed(decManualSpeed * sky * DEC_STEPS_PER_DEG * DEC_DIR);
+        stepperDEC.runSpeed();
+        decMoving = true; decStopTime = now;
+    } else if (decMoving && now - decStopTime > MOTOR_OFF_DELAY) {
+        decMoving = false;
+        if (!decHoldEnabled) enableDEC(false);
+    }
+
+    // — Доводка GoTo: пока оси шли, небо сместилось —
+    if (gotoPending && !raSlew && !decSlew) {
+        double h = mechHA(), d = mechDEC(), th, td;
+        eqToMech(targetRA_deg, targetDEC_deg, pierFlipped(d), h, th, td);
+        if (++gotoPass < 4 && fabs(th - h) * RA_STEPS_PER_DEG > 32) {
+            startSlewMech(th, td);
+        } else {
+            gotoPending = false;
         }
     }
 
-    if (stepperRA.distanceToGo() == 0 && stepperDEC.distanceToGo() == 0)
-        isSlewing = false;
+    isSlewing = raSlew || decSlew || gotoPending;
 
     updateCurrentCoords();
     lxHandleTCP();
@@ -855,6 +1014,15 @@ void handleStatus() {
     j += "\"parked\":"   + String(sParked)           + ",";
     j += "\"dec_hold\":" + String(sDecHold)          + ",";
     j += "\"ra_speed\":" + String(raSpeedMult, 3)    + ",";
+    double alt, az;
+    altAz(currentRA_deg, currentDEC_deg, alt, az);
+    bool westSide = !pierFlipped(mechDEC()) == (HOME_HA_DEG < 0);
+    j += "\"lst\":"      + String(lstDeg(), 4)      + ",";
+    j += "\"alt\":"      + String(alt, 2)           + ",";
+    j += "\"az\":"       + String(az, 2)            + ",";
+    j += "\"pier\":\""  + String(westSide ? "W" : "E") + "\",";
+    j += "\"time_ok\":"  + String(timeSource ? "true" : "false") + ",";
+    j += "\"time_src\":" + String(timeSource)       + ",";
     j += "\"ra_drv\":"   + String(raDrvOk  ? "true" : "false") + ",";
     j += "\"dec_drv\":"  + String(decDrvOk ? "true" : "false") + ",";
     j += "\"ip\":\""     + WiFi.localIP().toString() + "\"";
@@ -865,8 +1033,8 @@ void handleStatus() {
 void handleTracking() {
     bool en = server.hasArg("enable") && server.arg("enable") == "1";
     trackingEnabled = en;
-    enableRA(en);
-    if (!en) { stepperRA.stop(); raManualSpeed = 0; }
+    if (en) enableRA(true);   // выключит loop(), когда ось постоит
+    else    raManualSpeed = 0;
     server.send(200, "text/plain", "OK");
 }
 
@@ -879,14 +1047,12 @@ void handleRASpeed() {
 void handleJog() {
     String axis = server.hasArg("axis")  ? server.arg("axis")  : "";
     float  spd  = server.hasArg("speed") ? server.arg("speed").toFloat() : 0;
+    // RA: + на запад (механически), DEC: + на север (по небу)
+    if (spd != 0) haltSlew();
     if (axis == "ra") {
-        raManualSpeed = spd;
-        if (spd != 0) { enableRA(true); raMoving = true; raStopTime = millis(); }
-        else          { stepperRA.stop(); raStopTime = millis(); }
+        raManualSpeed = spd;  raStopTime  = millis();
     } else if (axis == "dec") {
-        decManualSpeed = spd;
-        if (spd != 0) { enableDEC(true); decMoving = true; decStopTime = millis(); }
-        else          { stepperDEC.stop(); decStopTime = millis(); }
+        decManualSpeed = spd; decStopTime = millis();
     }
     server.send(200, "text/plain", "OK");
 }
@@ -895,49 +1061,47 @@ void handleStopAll() {
     trackingEnabled = false;
     raManualSpeed   = 0;
     decManualSpeed  = 0;
-    stepperRA .stop();
-    stepperDEC.stop();
-    if (decHoldEnabled) {
-        enableDEC(true);    // удержание включено — держим ось
-    } else {
-        enableDEC(false);   // удержание выключено — отключаем
-    }
+    haltSlew();             // моторы выключит loop() после торможения
     raStopTime = decStopTime = millis();
     server.send(200, "text/plain", "OK");
 }
 
 void handleGoTo() {
     if (server.hasArg("ra") && server.hasArg("dec")) {
-        targetRA_deg  = server.arg("ra") .toDouble();
-        targetDEC_deg = server.arg("dec").toDouble();
-        startGoTo(targetRA_deg, targetDEC_deg);
+        if (!startGoTo(server.arg("ra").toDouble(), server.arg("dec").toDouble())) {
+            server.send(400, "text/plain",
+                        timeSource ? "Цель ниже горизонта" : "Время не задано");
+            return;
+        }
     }
     server.send(200, "text/plain", "OK");
 }
 
 void handleSync() {
     if (server.hasArg("ra") && server.hasArg("dec")) {
-        double ra  = server.arg("ra") .toDouble();
-        double dec = server.arg("dec").toDouble();
-        stepperRA .setCurrentPosition((long)(ra  * RA_STEPS_PER_DEG  * RA_DIR));
-        stepperDEC.setCurrentPosition((long)(dec * DEC_STEPS_PER_DEG * DEC_DIR));
-        Serial.printf("Sync → RA=%.4f° DEC=%.4f°\n", ra, dec);
+        if (!syncTo(server.arg("ra").toDouble(), server.arg("dec").toDouble())) {
+            server.send(400, "text/plain", "Время не задано");
+            return;
+        }
     }
     server.send(200, "text/plain", "OK");
 }
 
 void handleSetHome() {
-    stepperRA .setCurrentPosition(0);
-    stepperDEC.setCurrentPosition(0);
-    Serial.println(F("Home set (0°,0°)"));
+    setHomePosition();
     server.send(200, "text/plain", "OK");
 }
 
+// GET /set-time?ms=<unix ms> — время из браузера, если нет NTP
+void handleSetTime() {
+    if (server.hasArg("ms") && timeSource < 2)
+        setClock(server.arg("ms").toDouble() / 1000.0, 1);
+    server.send(200, "application/json",
+                String("{\"time_src\":") + timeSource + "}");
+}
+
 void handlePark() {
-    isParked = true;
-    trackingEnabled = false;
-    raManualSpeed = decManualSpeed = 0;
-    startGoTo(0, 0);
+    parkMount();
     server.send(200, "text/plain", "OK");
 }
 
@@ -973,7 +1137,7 @@ void handleEStop() {
     raManualSpeed   = 0;
     decManualSpeed  = 0;
     isSlewing       = false;
-    stepperRA .stop(); stepperDEC.stop();
+    abortSlew();
     enableRA(false);
     if (decHoldEnabled) {
         enableDEC(true);    // удержание включено — держим ось
@@ -1058,10 +1222,8 @@ void rts2_cmd() {
         }
         double ra  = cmd.substring(s1+1, s2).toDouble();
         double dec = cmd.substring(s2+1).toDouble();
-        targetRA_deg  = ra;
-        targetDEC_deg = dec;
-        startGoTo(ra, dec);
-        server.send(200, "application/json", "{\"ret\":0}");
+        server.send(200, "application/json",
+                    startGoTo(ra, dec) ? "{\"ret\":0}" : "{\"ret\":1}");
     } else if (isTLE) {
         // TLE для спутников — ESP8266 орбиту не считает,
         // сообщаем успех чтобы Stellarium не показывал ошибку
@@ -1277,6 +1439,42 @@ double lxParseDEC(const String& s) {
     return sgn * (dd + mm/60.0 + ss/3600.0);
 }
 
+// Дней от 1970-01-01 до даты (григорианский календарь)
+long daysFromCivil(int y, int m, int d) {
+    y -= m <= 2;
+    long era = (y >= 0 ? y : y - 399) / 400;
+    long yoe = y - era * 400;
+    long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// Местное время по смещению из :SG
+void lxLocalTime(tm& t) {
+    time_t lt = (time_t)(unixTimeNow() - lxUtcOffsetH * 3600.0);
+    gmtime_r(&lt, &t);
+}
+
+// "HH:MM:SS#" (или с дробной частью для HP-варианта)
+String lxFormatHMS(long secs, const char* frac) {
+    secs = ((secs % 86400) + 86400) % 86400;
+    char buf[24];
+    sprintf(buf, "%02ld:%02ld:%02ld%s#", secs / 3600, (secs / 60) % 60, secs % 60, frac);
+    return String(buf);
+}
+
+String lxLocalTimeStr(const char* frac) {
+    tm t; lxLocalTime(t);
+    return lxFormatHMS(t.tm_hour * 3600L + t.tm_min * 60 + t.tm_sec, frac);
+}
+
+String lxLocalDateStr() {
+    tm t; lxLocalTime(t);
+    char buf[12];
+    sprintf(buf, "%02d/%02d/%02d#", t.tm_mon + 1, t.tm_mday, t.tm_year % 100);
+    return String(buf);
+}
+
 // ============================================================
 //  LX200 / OnStep ОБРАБОТЧИК КОМАНД
 //
@@ -1329,10 +1527,10 @@ void lxProcessCommand(const String& cmd) {
 
     // ── Altitude / Azimuth (:GA# :GAH# :GZ# :GZH#) ──────────────────────
     // lx200driver: getLX200Alt(:GA#), getLX200Az(:GZ#)
-    } else if (cmd == "GA" || cmd == "GAH") {
-        lxSend(lxFormatDEC_HP(currentDEC_deg));
-    } else if (cmd == "GZ" || cmd == "GZH") {
-        lxSend(lxFormatAz(currentRA_deg));
+    } else if (cmd == "GA" || cmd == "GAH" || cmd == "GZ" || cmd == "GZH") {
+        double alt, az;
+        altAz(currentRA_deg, currentDEC_deg, alt, az);
+        lxSend(cmd.charAt(1) == 'A' ? lxFormatDEC_HP(alt) : lxFormatAz(az));
 
     // ── Target RA/DEC (:Gr# :GrH# :Gd# :GdH# :Gal# :GaH# :Gz# :GzH#) ──
     // lx200driver: getObjectRA(:Gr#), getObjectDEC(:Gd#)
@@ -1344,10 +1542,10 @@ void lxProcessCommand(const String& cmd) {
         lxSend(lxFormatDEC_HP(targetDEC_deg));
     } else if (cmd == "GdH") {
         lxSend(lxFormatDEC_HP(targetDEC_deg));
-    } else if (cmd == "Gal" || cmd == "GaH") {
-        lxSend(lxFormatDEC_HP(targetDEC_deg));
-    } else if (cmd == "Gz" || cmd == "GzH") {
-        lxSend(lxFormatAz(targetRA_deg));
+    } else if (cmd == "Gal" || cmd == "GaH" || cmd == "Gz" || cmd == "GzH") {
+        double alt, az;
+        altAz(targetRA_deg, targetDEC_deg, alt, az);
+        lxSend(cmd.charAt(1) == 'a' ? lxFormatDEC_HP(alt) : lxFormatAz(az));
 
     // ── Set target (:SrHH:MM:SS# / :Sd[s]DD*MM:SS#) ─────────────────────
     // lx200driver: setObjectRA(:Sr..#), setObjectDEC(:Sd..#)
@@ -1375,11 +1573,11 @@ void lxProcessCommand(const String& cmd) {
     } else if (cmd == "MS") {
         if (isParked)        { lxSend("4"); }
         else if (isSlewing)  { lxSend("5"); }
-        else { startGoTo(targetRA_deg, targetDEC_deg); lxSend("0"); }
+        else { lxSend(startGoTo(targetRA_deg, targetDEC_deg) ? "0" : "1"); }
 
     } else if (cmd == "MA") {
         if (isParked) { lxSend("4"); }
-        else { startGoTo(targetRA_deg, targetDEC_deg); lxSend("0"); }
+        else { lxSend(startGoTo(targetRA_deg, targetDEC_deg) ? "0" : "1"); }
 
     } else if (cmd == "MD") {
         // 0=East, 1=West, 2=Unknown
@@ -1387,7 +1585,7 @@ void lxProcessCommand(const String& cmd) {
 
     } else if (cmd == "MN" || cmd == "MNe" || cmd == "MNw") {
         if (isParked) { lxSend("4"); }
-        else { startGoTo(targetRA_deg, targetDEC_deg); lxSend("0"); }
+        else { lxSend(startGoTo(targetRA_deg, targetDEC_deg) ? "0" : "1"); }
 
     } else if (cmd == "MP") {
         lxSend(isParked ? "4" : "0");
@@ -1395,13 +1593,7 @@ void lxProcessCommand(const String& cmd) {
     // ── Sync (:CM# :CS#) ─────────────────────────────────────────────────
     // lx200driver: Sync(:CM#) → "N/A#" on success, "En#" on failure
     } else if (cmd == "CM" || cmd == "CS") {
-        stepperRA .setCurrentPosition(
-            (long)(targetRA_deg  * RA_STEPS_PER_DEG  * RA_DIR));
-        stepperDEC.setCurrentPosition(
-            (long)(targetDEC_deg * DEC_STEPS_PER_DEG * DEC_DIR));
-        lxSend("N/A#");
-        Serial.printf("  [LX] Synced RA=%.4f° DEC=%.4f°\n",
-                      targetRA_deg, targetDEC_deg);
+        lxSend(syncTo(targetRA_deg, targetDEC_deg) ? "N/A#" : "E0#");
 
     // ── Alignment (:A[n]# :A+# :AW#) ────────────────────────────────────
     } else if (cmd == "AW") {
@@ -1425,16 +1617,9 @@ void lxProcessCommand(const String& cmd) {
                           || cmd == "Qn" || cmd == "Qs") {
         bool doRA  = (cmd=="Q" || cmd=="Qe" || cmd=="Qw");
         bool doDEC = (cmd=="Q" || cmd=="Qn" || cmd=="Qs");
-        if (doRA) {
-            raManualSpeed = 0;
-            if (!trackingEnabled) { stepperRA.stop(); raStopTime=millis(); }
-        }
-        if (doDEC) {
-            decManualSpeed = 0;
-            stepperDEC.stop();
-            enableDEC(true);  // держим DEC включённым
-        }
-        if (cmd == "Q") isSlewing = false;
+        if (doRA)  raManualSpeed  = 0;
+        if (doDEC) decManualSpeed = 0;
+        if (cmd == "Q") haltSlew();
         // нет ответа
 
     // ── Tracking (:Te# :Td# :TQ# :TS# :TK# :TL# :T+# :T-# :TR#
@@ -1443,7 +1628,7 @@ void lxProcessCommand(const String& cmd) {
     } else if (cmd == "Te") {
         trackingEnabled = true; enableRA(true); lxSend("1");
     } else if (cmd == "Td") {
-        trackingEnabled = false; stepperRA.stop(); raManualSpeed=0; lxSend("1");
+        trackingEnabled = false; raManualSpeed=0; lxSend("1");
     } else if (cmd == "TQ") {
         raSpeedMult = 1.0f; lxSend("1");
     } else if (cmd == "TS") {
@@ -1466,24 +1651,20 @@ void lxProcessCommand(const String& cmd) {
     // ── Park / Home (:hP# :hR# :hF# :hC# :hQ# :hA[n]#) ─────────────────
     // lx200driver: slewToPark(:hP#), gpsWakeUp/Sleep (:hW#/:hN#)
     } else if (cmd == "hP") {
-        if (!isParked) {
-            isParked=true; trackingEnabled=false;
-            raManualSpeed=decManualSpeed=0;
-            startGoTo(0,0); lxSend("1");
-        } else { lxSend("0"); }
+        if (!isParked) { parkMount(); lxSend("1"); }
+        else           { lxSend("0"); }
 
     } else if (cmd == "hR") {
         if (isParked) { isParked=false; enableDEC(true); lxSend("1"); }
         else          { lxSend("0"); }
 
     } else if (cmd == "hF") {
-        stepperRA .setCurrentPosition(0);
-        stepperDEC.setCurrentPosition(0);
+        setHomePosition();
         isParked = false;
         // нет ответа
 
     } else if (cmd == "hC") {
-        startGoTo(0, 0);
+        startSlewMech(HOME_HA_DEG, 90.0);
         // нет ответа
 
     } else if (cmd == "hQ") {
@@ -1495,10 +1676,10 @@ void lxProcessCommand(const String& cmd) {
     // ── Manual move (:Me# :Mw# :Mn# :Ms# :Mp#) ──────────────────────────
     // lx200driver: MoveTo(:Me#/:Mw#/:Mn#/:Ms#)  (нет ответа)
     } else if (cmd == "Me") {
-        enableRA(true);  raManualSpeed  =  lxGuideRate;
+        enableRA(true);  raManualSpeed  = -lxGuideRate;   // восток: HA уменьшается
         raMoving=true;   raStopTime=millis();
     } else if (cmd == "Mw") {
-        enableRA(true);  raManualSpeed  = -lxGuideRate;
+        enableRA(true);  raManualSpeed  =  lxGuideRate;
         raMoving=true;   raStopTime=millis();
     } else if (cmd == "Mn") {
         enableDEC(true); decManualSpeed =  lxGuideRate;
@@ -1563,7 +1744,8 @@ void lxProcessCommand(const String& cmd) {
     } else if (cmd == "Gm") {
         // lx200driver нет прямого; OnStep: E#/W#/N#
         if (isParked) lxSend("N#");
-        else lxSend(currentRA_deg < 180.0 ? "E#" : "W#");
+        // сторона опоры, где стоит труба: у HOME_HA_DEG < 0 обычная сторона — западная
+        else lxSend(!pierFlipped(mechDEC()) == (HOME_HA_DEG < 0) ? "W#" : "E#");
 
     // ── Site (:Gt# :GtH# :Gg# :GgH# :Gv#) ──────────────────────────────
     // lx200driver: getSiteLatitude(:Gt#), getSiteLongitude(:Gg#)
@@ -1575,49 +1757,64 @@ void lxProcessCommand(const String& cmd) {
         char buf[14]; sprintf(buf, "+%.1f#", obsAltitude_m);
         lxSend(String(buf));
 
+    // lx200driver: setSiteLatitude(:StsDD*MM#), setSiteLongitude(:SgDDD*MM#, West +)
+    } else if (cmd.startsWith("St")) {
+        obsLatitude_deg = lxParseDEC(cmd.substring(2));
+        lxSend("1");
+        Serial.printf("  [LX] Latitude=%.4f°\n", obsLatitude_deg);
+    } else if (cmd.startsWith("Sg")) {
+        obsLongitude_deg = wrap180(-lxParseDEC(cmd.substring(2)));
+        lxSend("1");
+        Serial.printf("  [LX] Longitude=%.4f° E\n", obsLongitude_deg);
+
     // ── Time / Date (:GL# :GLH# :GG# :GS# :GSH# :GC# :Ga# :Gc#) ────────
     // lx200driver: getLocalTime24(:GL#), getLocalTime12(:Ga#),
     //              getSDTime(:GS#), getCalendarDate(:GC#)
     } else if (cmd == "GL" || cmd == "GLH") {
-        unsigned long s  = millis()/1000;
-        unsigned long hh = (s/3600)%24, mm=(s%3600)/60, ss2=s%60;
-        char buf[24];
-        if (cmd == "GLH") sprintf(buf, "%02lu:%02lu:%02lu.0000#", hh, mm, ss2);
-        else              sprintf(buf, "%02lu:%02lu:%02lu#",       hh, mm, ss2);
-        lxSend(String(buf));
+        lxSend(lxLocalTimeStr(cmd == "GLH" ? ".0000" : ""));
 
     } else if (cmd == "GG") {
-        // lx200driver: getUTCOffset(:GG#) → int
-        lxSend("+00:00#");
+        // lx200driver: getUTCOffset(:GG#) — часы, которые прибавить к местному до UTC
+        int m = (int)lround(fabs(lxUtcOffsetH) * 60.0);
+        char buf[12];
+        sprintf(buf, "%c%02d:%02d#", lxUtcOffsetH < 0 ? '-' : '+', m / 60, m % 60);
+        lxSend(String(buf));
 
     } else if (cmd == "GS" || cmd == "GSH") {
-        // lx200driver: getSDTime(:GS#)
-        unsigned long s  = millis()/1000;
-        unsigned long hh = (s/3600)%24, mm=(s%3600)/60, ss2=s%60;
-        char buf[24];
-        if (cmd == "GSH") sprintf(buf, "%02lu:%02lu:%02lu.00#", hh, mm, ss2);
-        else              sprintf(buf, "%02lu:%02lu:%02lu#",     hh, mm, ss2);
-        lxSend(String(buf));
+        // lx200driver: getSDTime(:GS#) — местное звёздное время
+        lxSend(lxFormatHMS(lround(lstDeg() / 15.0 * 3600.0) , cmd == "GSH" ? ".00" : ""));
 
     } else if (cmd == "GC") {
         // lx200driver: getCalendarDate(:GC#) → MM/DD/YY
-        lxSend("01/01/00#");
+        lxSend(lxLocalDateStr());
 
     } else if (cmd == "Ga") {
         // lx200driver: getLocalTime12(:Ga#)
-        unsigned long s  = millis()/1000;
-        unsigned long hh = (s/3600)%12; if(!hh) hh=12;
-        unsigned long mm = (s%3600)/60, ss2=s%60;
-        char buf[14]; sprintf(buf, "%02lu:%02lu:%02lu#", hh, mm, ss2);
-        lxSend(String(buf));
+        tm t; lxLocalTime(t);
+        int hh = t.tm_hour % 12; if (!hh) hh = 12;
+        lxSend(lxFormatHMS(hh * 3600L + t.tm_min * 60 + t.tm_sec, ""));
 
     } else if (cmd == "Gc") {
         lxSend("24#");
 
     // ── Set time/date/UTC (:SC# :SG# :SL#) ──────────────────────────────
     // lx200driver: setCalenderDate, setUTCOffset, setLocalTime → 0/1
-    } else if (cmd.startsWith("SC") || cmd.startsWith("SG")
-            || cmd.startsWith("SL")) {
+    // Часы ставятся по :SC (после :SG и :SL), только если нет NTP
+    } else if (cmd.startsWith("SG")) {
+        lxUtcOffsetH = cmd.substring(2).toFloat();
+        lxSend("1");
+    } else if (cmd.startsWith("SL")) {
+        String a = cmd.substring(2);
+        lxLocalSecs = a.substring(0, 2).toInt() * 3600L
+                    + a.substring(3, 5).toInt() * 60 + a.substring(6, 8).toInt();
+        lxSend("1");
+    } else if (cmd.startsWith("SC")) {
+        String a = cmd.substring(2);   // MM/DD/YY
+        if (lxLocalSecs >= 0 && timeSource < 2) {
+            long days = daysFromCivil(2000 + a.substring(6, 8).toInt(),
+                                      a.substring(0, 2).toInt(), a.substring(3, 5).toInt());
+            setClock(days * 86400.0 + lxLocalSecs + lxUtcOffsetH * 3600.0, 1);
+        }
         lxSend("1");
 
     // ── Site names (:GM# :GN# :GO# :GP# :SM# :SN# :SO# :SP# :W[n]#) ────
@@ -1636,7 +1833,9 @@ void lxProcessCommand(const String& cmd) {
     // ── Limits (:Gh# :Go# :Sh# :So# :GXE[m]#) ───────────────────────────
     // lx200driver: getMaxElevationLimit(:Go#), getMinElevationLimit(:Gh#)
     //              setMaxElevationLimit(:So#), setMinElevationLimit(:Sh#)
-    } else if (cmd == "Gh") { lxSend("-10*#");
+    } else if (cmd == "Gh") {
+        char buf[8]; sprintf(buf, "%+03d*#", (int)GOTO_MIN_ALT);
+        lxSend(String(buf));
     } else if (cmd == "Go") { lxSend("90*#");
     } else if (cmd.startsWith("Sh") || cmd.startsWith("So")) { lxSend("1");
     } else if (cmd.startsWith("GXE")) { lxSend("0#");
@@ -1689,12 +1888,8 @@ void lxProcessCommand(const String& cmd) {
     } else if (cmd == "GXTR")         { lxSend("0.000000#");
 
     // ── Time/date status (:GX80# :GX81# :GX89#) ─────────────────────────
-    } else if (cmd == "GX80") {
-        unsigned long s=millis()/1000;
-        char buf[20];
-        sprintf(buf,"%02lu:%02lu:%02lu.00#",(s/3600)%24,(s%3600)/60,s%60);
-        lxSend(String(buf));
-    } else if (cmd == "GX81") { lxSend("01/01/00#");
+    } else if (cmd == "GX80") { lxSend(lxLocalTimeStr(".00"));
+    } else if (cmd == "GX81") { lxSend(lxLocalDateStr());
     } else if (cmd == "GX89") { lxSend("0");
 
     // ── PEC заглушки (:VH# :VR# :Vr# :VS# :VW# :WR+# :WR-#
