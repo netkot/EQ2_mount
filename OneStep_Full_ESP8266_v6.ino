@@ -292,7 +292,8 @@ const char* htmlPage = R"rawliteral(
     /* ── D-pad ── */
     .dpad{display:grid;grid-template-columns:repeat(3,60px);
           grid-template-rows:repeat(3,48px);gap:6px;margin:0 auto;width:198px}
-    .dpad button{padding:0;font-size:18px;border-radius:7px;margin:0;width:auto;height:auto}
+    .dpad button{padding:0;font-size:18px;border-radius:7px;margin:0;width:auto;height:auto;line-height:1.1}
+    .dpad button small{display:block;font-size:11px;font-weight:600;opacity:.85}
     .cell-N{grid-column:2;grid-row:1}
     .cell-W{grid-column:1;grid-row:2}
     .cell-C{grid-column:2;grid-row:2}
@@ -357,17 +358,17 @@ const char* htmlPage = R"rawliteral(
       <div class="dpad">
         <button class="btn-nav cell-N"
           onmousedown="jog('dec',1)" onmouseup="jogStop('dec')"
-          ontouchstart="jog('dec',1)" ontouchend="jogStop('dec')">▲</button>
+          ontouchstart="jog('dec',1)" ontouchend="jogStop('dec')">▲<small>DEC+</small></button>
         <button class="btn-nav cell-W"
           onmousedown="jog('ra',-1)" onmouseup="jogStop('ra')"
-          ontouchstart="jog('ra',-1)" ontouchend="jogStop('ra')">◄</button>
+          ontouchstart="jog('ra',-1)" ontouchend="jogStop('ra')">◄<small>RA−</small></button>
         <button class="btn-stop cell-C" onclick="stopAll()">■</button>
         <button class="btn-nav cell-E"
           onmousedown="jog('ra',1)" onmouseup="jogStop('ra')"
-          ontouchstart="jog('ra',1)" ontouchend="jogStop('ra')">►</button>
+          ontouchstart="jog('ra',1)" ontouchend="jogStop('ra')">►<small>RA+</small></button>
         <button class="btn-nav cell-D"
           onmousedown="jog('dec',-1)" onmouseup="jogStop('dec')"
-          ontouchstart="jog('dec',-1)" ontouchend="jogStop('dec')">▼</button>
+          ontouchstart="jog('dec',-1)" ontouchend="jogStop('dec')">▼<small>DEC−</small></button>
       </div>
       <div style="margin-top:10px">
         <label>Jog speed: <span id="jogVal">14</span> °/s</label>
