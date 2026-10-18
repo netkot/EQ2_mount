@@ -483,7 +483,7 @@ const char* htmlPage = R"rawliteral(
 
   <!-- ═══ Статус (всегда виден) ════════════════════════════════════════ -->
   <div class="statusbar">
-    <div class="coords">RA <span id="raVal">—</span>°&nbsp;&nbsp;DEC <span id="decVal">—</span>°</div>
+    <div class="coords">RA <span id="raHms">—</span> (<span id="raVal">—</span>°)&nbsp;&nbsp;DEC <span id="decVal">—</span>°</div>
     <span id="statusBox">Loading…</span>
   </div>
 
@@ -659,6 +659,7 @@ function tog(hdr){
 function poll(){
   fetch('/status').then(r=>r.json()).then(d=>{
     document.getElementById('raVal').innerText=fmt(d.ra_deg);
+    document.getElementById('raHms').innerText=hms(d.ra_deg).replace(/(\d+):(\d+):(\d+)/,'$1h$2m$3s');
     document.getElementById('decVal').innerText=fmt(d.dec_deg);
     document.getElementById('statusBox').innerHTML=
       '<b>Tracking:</b> '+(d.tracking?'<span style="color:#10b981">ON</span>':'OFF')+
