@@ -440,15 +440,16 @@ const char* htmlPage = R"rawliteral(
     button:active{filter:brightness(.9)}
 
     /* ── D-pad ── */
-    .dpad{display:grid;grid-template-columns:repeat(3,60px);
-          grid-template-rows:repeat(3,48px);gap:6px;margin:0 auto;width:198px}
+    .dpad{display:grid;grid-template-columns:repeat(5,52px);
+          grid-template-rows:repeat(5,44px);gap:6px;margin:0 auto;width:284px}
     .dpad button{padding:0;font-size:18px;border-radius:7px;margin:0;width:auto;height:auto;line-height:1.1}
-    .dpad button small{display:block;font-size:11px;font-weight:600;opacity:.85}
-    .cell-N{grid-column:2;grid-row:1}
-    .cell-W{grid-column:1;grid-row:2}
-    .cell-C{grid-column:2;grid-row:2}
-    .cell-E{grid-column:3;grid-row:2}
-    .cell-D{grid-column:2;grid-row:3}
+    .dpad button small{display:block;font-size:10px;font-weight:600;opacity:.85}
+    .dpad .fine{font-size:13px;opacity:.8}
+    .cell-N {grid-column:3;grid-row:1}  .cell-n{grid-column:3;grid-row:2}
+    .cell-W {grid-column:1;grid-row:3}  .cell-w{grid-column:2;grid-row:3}
+    .cell-C {grid-column:3;grid-row:3}
+    .cell-e {grid-column:4;grid-row:3}  .cell-E{grid-column:5;grid-row:3}
+    .cell-s {grid-column:3;grid-row:4}  .cell-D{grid-column:3;grid-row:5}
 
     /* ── Info box ── */
     .ibox{background:rgba(0,0,0,0.22);border-radius:7px;
@@ -505,19 +506,32 @@ const char* htmlPage = R"rawliteral(
   <!-- ═══ Ручное управление (всегда видно) ════════════════════════════ -->
   <div class="card card-always">
     <div class="card-body">
+      <!-- Внешние стрелки — скорость с ползунка, внутренние — медленно (JOG_FINE) -->
       <div class="dpad">
         <button class="btn-nav cell-N"
-          onmousedown="jog('dec',1)" onmouseup="jogStop('dec')"
+          onmousedown="jog('dec',1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
           ontouchstart="jog('dec',1)" ontouchend="jogStop('dec')">▲<small>N · DEC+</small></button>
+        <button class="btn-nav fine cell-n" title="Медленно"
+          onmousedown="jogFine('dec',1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
+          ontouchstart="jogFine('dec',1)" ontouchend="jogStop('dec')">▴<small>slow</small></button>
         <button class="btn-nav cell-W"
-          onmousedown="jog('ra',-1)" onmouseup="jogStop('ra')"
+          onmousedown="jog('ra',-1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jog('ra',-1)" ontouchend="jogStop('ra')">◄<small>E · RA+</small></button>
+        <button class="btn-nav fine cell-w" title="Медленно"
+          onmousedown="jogFine('ra',-1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
+          ontouchstart="jogFine('ra',-1)" ontouchend="jogStop('ra')">◂<small>slow</small></button>
         <button class="btn-stop cell-C" onclick="stopAll()">■</button>
+        <button class="btn-nav fine cell-e" title="Медленно"
+          onmousedown="jogFine('ra',1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
+          ontouchstart="jogFine('ra',1)" ontouchend="jogStop('ra')">▸<small>slow</small></button>
         <button class="btn-nav cell-E"
-          onmousedown="jog('ra',1)" onmouseup="jogStop('ra')"
+          onmousedown="jog('ra',1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jog('ra',1)" ontouchend="jogStop('ra')">►<small>W · RA−</small></button>
+        <button class="btn-nav fine cell-s" title="Медленно"
+          onmousedown="jogFine('dec',-1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
+          ontouchstart="jogFine('dec',-1)" ontouchend="jogStop('dec')">▾<small>slow</small></button>
         <button class="btn-nav cell-D"
-          onmousedown="jog('dec',-1)" onmouseup="jogStop('dec')"
+          onmousedown="jog('dec',-1)" onmouseup="jogStop('dec')" onmouseleave="if(event.buttons)jogStop('dec')"
           ontouchstart="jog('dec',-1)" ontouchend="jogStop('dec')">▼<small>S · DEC−</small></button>
       </div>
       <div style="margin-top:10px">
@@ -703,6 +717,9 @@ function setTrackSpeed(v){
 function jog(axis,dir){
   fetch('/jog?axis='+axis+'&speed='+(dir*document.getElementById('jogSpeed').value));
 }
+// Медленный джог для центрирования, °/с (≈24× сидерической)
+var JOG_FINE=0.1;
+function jogFine(axis,dir){fetch('/jog?axis='+axis+'&speed='+(dir*JOG_FINE));}
 function jogStop(axis){fetch('/jog?axis='+axis+'&speed=0');}
 function stopAll(){fetch('/stop-all').then(poll);}
 
