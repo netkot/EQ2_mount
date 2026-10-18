@@ -535,8 +535,9 @@ const char* htmlPage = R"rawliteral(
     <div class="card-body">
       <div class="g2">
         <div>
-          <label>RA (degrees 0–360):</label>
-          <input type="number" id="gotoRA" value="0" step="0.001" min="0" max="360">
+          <label>RA (° или часы — 02:31:49, 2h31m49s):</label>
+          <input type="text" id="gotoRA" value="0" oninput="raHint()">
+          <div id="raHint" style="font-size:11px;color:#888;margin-top:2px">= 0.0000°</div>
         </div>
         <div>
           <label>DEC (degrees −90..+90):</label>
@@ -703,14 +704,35 @@ function jogStop(axis){fetch('/jog?axis='+axis+'&speed=0');}
 function stopAll(){fetch('/stop-all').then(poll);}
 
 /* ── GoTo ── */
+/* RA: число — градусы; с ':' или h/m/s — часы (дробные часы: '2.53h') */
+function parseRA(t){
+  t=t.trim().replace(',','.');
+  if(/^[+]?\d+(\.\d+)?$/.test(t))return parseFloat(t);
+  var m=t.match(/^(\d+(?:\.\d+)?)\s*[h:ч]\s*(?:(\d+(?:\.\d+)?)\s*[m:м]?\s*(?:(\d+(?:\.\d+)?)\s*[sс]?)?)?$/i);
+  if(!m)return NaN;
+  var h=parseFloat(m[1])+(m[2]?parseFloat(m[2])/60:0)+(m[3]?parseFloat(m[3])/3600:0);
+  return h<24?h*15:NaN;
+}
+function raDeg(){
+  var v=parseRA(document.getElementById('gotoRA').value);
+  if(isNaN(v)||v<0||v>=360){alert('Неверный RA');return null;}
+  return v;
+}
+function raHint(){
+  var v=parseRA(document.getElementById('gotoRA').value);
+  document.getElementById('raHint').innerText=(isNaN(v)||v>=360)?'неверный формат':
+    '= '+fmt(v)+'° = '+hms(v).replace(/(\d+):(\d+):(\d+)/,'$1h$2m$3s');
+}
 function doGoTo(){
-  fetch('/goto?ra='+document.getElementById('gotoRA').value+
+  var ra=raDeg(); if(ra===null)return;
+  fetch('/goto?ra='+ra+
               '&dec='+document.getElementById('gotoDEC').value)
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
 function setHome(){fetch('/set-home').then(poll);}
 function doSync(){
-  fetch('/sync?ra='+document.getElementById('gotoRA').value+
+  var ra=raDeg(); if(ra===null)return;
+  fetch('/sync?ra='+ra+
               '&dec='+document.getElementById('gotoDEC').value)
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
