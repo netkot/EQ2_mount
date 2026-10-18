@@ -417,7 +417,7 @@ const char* htmlPage = R"rawliteral(
     label{display:block;margin-bottom:4px;font-size:.85em;color:#bbb}
     input[type=range]{width:100%;height:5px;border-radius:3px;
                       background:rgba(255,255,255,0.15);outline:none;margin-top:2px}
-    input[type=number]{width:100%;padding:7px 10px;
+    input[type=number],input[type=text]{width:100%;padding:7px 10px;
                        border:1px solid rgba(255,255,255,0.15);border-radius:7px;
                        background:rgba(255,255,255,0.08);color:#fff;font-size:14px}
 
@@ -540,8 +540,9 @@ const char* htmlPage = R"rawliteral(
           <div id="raHint" style="font-size:11px;color:#888;margin-top:2px">= 0.0000°</div>
         </div>
         <div>
-          <label>DEC (degrees −90..+90):</label>
-          <input type="number" id="gotoDEC" value="0" step="0.001" min="-90" max="90">
+          <label>DEC (° или ° ′ ″ — +89 15 51, 89°15′51″):</label>
+          <input type="text" id="gotoDEC" value="0" oninput="decHint()">
+          <div id="decHint" style="font-size:11px;color:#888;margin-top:2px">= 0.0000°</div>
         </div>
       </div>
       <button class="btn-goto" onclick="doGoTo()" style="margin-top:8px">🚀 Go To</button>
@@ -718,22 +719,43 @@ function raDeg(){
   if(isNaN(v)||v<0||v>=360){alert('Неверный RA');return null;}
   return v;
 }
+/* DEC: знак, затем до трёх чисел (градусы, минуты, секунды) через любые
+   разделители — пробел, :, °, ′, ″, d m s. Одно число — дробные градусы. */
+function parseDEC(t){
+  t=t.trim().replace(',','.');
+  var sg=/^-/.test(t)?-1:1;
+  var p=t.replace(/[^0-9.]+/g,' ').trim().split(' ');
+  if(!p[0]||p.length>3||p.some(x=>isNaN(parseFloat(x))))return NaN;
+  var d=parseFloat(p[0]),m=p[1]?parseFloat(p[1]):0,s=p[2]?parseFloat(p[2]):0;
+  if(m>=60||s>=60)return NaN;
+  var v=sg*(d+m/60+s/3600);
+  return Math.abs(v)<=90?v:NaN;
+}
+function dms(v){var s=Math.round(Math.abs(v)*3600);
+  return (v<0?'−':'+')+(s/3600|0)+'°'+('0'+((s/60|0)%60)).slice(-2)+'′'+('0'+s%60).slice(-2)+'″';}
+function decDeg(){
+  var v=parseDEC(document.getElementById('gotoDEC').value);
+  if(isNaN(v)){alert('Неверный DEC');return null;}
+  return v;
+}
+function decHint(){
+  var v=parseDEC(document.getElementById('gotoDEC').value);
+  document.getElementById('decHint').innerText=isNaN(v)?'неверный формат':'= '+fmt(v)+'° = '+dms(v);
+}
 function raHint(){
   var v=parseRA(document.getElementById('gotoRA').value);
   document.getElementById('raHint').innerText=(isNaN(v)||v>=360)?'неверный формат':
     '= '+fmt(v)+'° = '+hms(v).replace(/(\d+):(\d+):(\d+)/,'$1h$2m$3s');
 }
 function doGoTo(){
-  var ra=raDeg(); if(ra===null)return;
-  fetch('/goto?ra='+ra+
-              '&dec='+document.getElementById('gotoDEC').value)
+  var ra=raDeg(), dec=decDeg(); if(ra===null||dec===null)return;
+  fetch('/goto?ra='+ra+'&dec='+dec)
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
 function setHome(){fetch('/set-home').then(poll);}
 function doSync(){
-  var ra=raDeg(); if(ra===null)return;
-  fetch('/sync?ra='+ra+
-              '&dec='+document.getElementById('gotoDEC').value)
+  var ra=raDeg(), dec=decDeg(); if(ra===null||dec===null)return;
+  fetch('/sync?ra='+ra+'&dec='+dec)
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
 
