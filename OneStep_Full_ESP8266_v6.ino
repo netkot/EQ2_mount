@@ -197,6 +197,9 @@ String     lxTcpBuf          = "";
 bool       lxInCommand       = false;
 
 // LX200 переменные
+// Скорости :R0#..:R9# в кратных сидерической — как подписаны в INDI LX200 OnStep
+const float LX_RATES[10] = {0.25f, 0.5f, 1.f, 2.f, 4.f, 8.f, 20.f, 48.f, 120.f, 240.f};
+uint8_t lxRateIndex   = 2;
 float lxGuideRate     = SIDEREAL_RATE; // °/сек (1× sidereal по умолчанию)
 bool  lxHighPrecision = true;          // true = HH:MM:SS / +DD*MM:SS
 
@@ -682,7 +685,9 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     </div>
     <div class="card-body">
       <div class="ibox" style="margin-top:0;margin-bottom:8px">
-        Version: <b>6.0</b> &nbsp;|&nbsp; <span class="dot dot-g"></span>Ready
+        Version: <b>6.0</b> &nbsp;|&nbsp; <span id="fwDot" class="dot dot-r"></span><span id="fwState">No connection</span>
+        <br>Build: <b id="fwBuild">—</b> &nbsp;|&nbsp; Uptime: <span id="fwUp">—</span>
+        <br>WiFi: <span id="fwRssi">—</span> &nbsp;|&nbsp; Free RAM: <span id="fwHeap">—</span>
       </div>
       <button class="btn-muted" onclick="window.open('/update','_blank')" title="Открыть страницу загрузки новой прошивки по WiFi">Open Update Page</button>
       <p style="font-size:11px;color:#666;margin-top:6px">⚠ Do not disconnect power during update!</p>
@@ -725,9 +730,32 @@ function poll(){
     document.getElementById('rts2dot').className=
       'dot '+(d.tracking||d.slewing?'dot-g':'dot-r');
     if(typeof d.dec_hold!=='undefined') updateDecHoldUI(d.dec_hold);
+    var bad=[];
+    if(d.ra_drv===false) bad.push('RA');
+    if(d.dec_drv===false) bad.push('DEC');
+    setFwState(!bad.length,bad.length?'Driver fault: '+bad.join(', '):'Ready');
+    document.getElementById('fwBuild').innerText=d.fw||'—';
+    document.getElementById('fwUp').innerText=d.up!=null?upTime(d.up):'—';
+    // Сигнал хуже −75 dBm и свободный блок памяти меньше 4 КБ — уже проблема
+    if(d.rssi!=null) document.getElementById('fwRssi').innerHTML=
+      '<span style="color:'+(d.rssi<-75?'#ef4444':d.rssi<-67?'#f59e0b':'#10b981')+'">'+d.rssi+' dBm</span>';
+    if(d.heap!=null) document.getElementById('fwHeap').innerHTML=
+      '<span style="color:'+(d.heap_max<4096?'#ef4444':'inherit')+'">'+(d.heap/1024).toFixed(1)+
+      ' KB (max block '+(d.heap_max/1024).toFixed(1)+' KB)</span>';
   }).catch(()=>{
     document.getElementById('statusBox').innerText='Connection error…';
+    setFwState(false,'No connection');
   });
+}
+
+function setFwState(ok,txt){
+  document.getElementById('fwDot').className='dot '+(ok?'dot-g':'dot-r');
+  document.getElementById('fwState').innerText=txt;
+}
+// Аптайм: сразу после прошивки сбрасывается — видно, что монтировка перезагрузилась
+function upTime(s){
+  var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+  return (d?d+'d ':'')+(d||h?h+'h ':'')+m+'m '+(s%60)+'s';
 }
 
 /* ── Трекинг ── */
@@ -978,6 +1006,13 @@ void setup() {
     stepperDEC.setMaxSpeed(decMaxSpeed); stepperDEC.setAcceleration(decAccel);
     setHomePosition();   // после включения монтировка считается в доме
 
+    // Режим не пишем во флеш: иначе после запуска точки доступа ESP так и
+    // остаётся в AP+STA и радио прыгает по каналам. Сон модема выключаем —
+    // с ним ESP теряет пакеты и кнопки веб-интерфейса «не срабатывают».
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(ssid, password);
     Serial.print(F("WiFi connecting"));
     for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
@@ -1066,16 +1101,22 @@ void loop() {
         }
     }
 
-    // — DEC: GoTo или джог. Джог по небу (север +), за полюсом механика наоборот.
+    // — DEC: GoTo или джог. Джог механический, независимо от положения трубы:
+    //   + всегда в одну сторону оси, − в другую, по кругу через полюс.
     //   Мотор DEC после остановки не выключаем, если включено удержание —
     if (decSlew) {
         if (!stepperDEC.run()) decSlew = false;
         decStopTime = now;
     } else if (decManualSpeed != 0.0f) {
-        float sky = pierFlipped(mechDEC()) ? -1.0f : 1.0f;
         enableDEC(true);
-        stepperDEC.setSpeed(decManualSpeed * sky * DEC_STEPS_PER_DEG * DEC_DIR);
+        stepperDEC.setSpeed(decManualSpeed * DEC_STEPS_PER_DEG * DEC_DIR);
         stepperDEC.runSpeed();
+        // Полный оборот: держим механический DEC в (−90°, 270°]
+        double d = mechDEC();
+        if (d > 270.0 || d <= -90.0) {
+            long turn = lround(360.0 * DEC_STEPS_PER_DEG * DEC_DIR);
+            stepperDEC.setCurrentPosition(stepperDEC.currentPosition() + (d > 270.0 ? -turn : turn));
+        }
         decMoving = true; decStopTime = now;
     } else if (decMoving && now - decStopTime > MOTOR_OFF_DELAY) {
         decMoving = false;
@@ -1119,6 +1160,8 @@ void handleStatus() {
     j += "\"parked\":"   + String(sParked)           + ",";
     j += "\"dec_hold\":" + String(sDecHold)          + ",";
     j += "\"ra_speed\":" + String(raSpeedMult, 3)    + ",";
+    j += "\"fw\":\"" __DATE__ " " __TIME__ "\",";
+    j += "\"up\":"     + String(millis() / 1000)  + ",";
     double alt, az;
     altAz(currentRA_deg, currentDEC_deg, alt, az);
     bool westSide = !pierFlipped(mechDEC()) == (HOME_HA_DEG < 0);
@@ -1130,6 +1173,9 @@ void handleStatus() {
     j += "\"time_src\":" + String(timeSource)       + ",";
     j += "\"ra_drv\":"   + String(raDrvOk  ? "true" : "false") + ",";
     j += "\"dec_drv\":"  + String(decDrvOk ? "true" : "false") + ",";
+    j += "\"rssi\":"     + String(WiFi.RSSI())             + ",";
+    j += "\"heap\":"     + String(ESP.getFreeHeap())       + ",";
+    j += "\"heap_max\":" + String(ESP.getMaxFreeBlockSize()) + ",";
     j += "\"ip\":\""     + WiFi.localIP().toString() + "\"";
     j += "}";
     server.send(200, "application/json", j);
@@ -1797,14 +1843,11 @@ void lxProcessCommand(const String& cmd) {
 
     // ── Guide rate (:RG# :RC# :RM# :RF# :RS# :Rn#) ──────────────────────
     // lx200driver: setSlewMode / setSlewSpeed  (нет ответа)
-    } else if (cmd == "RG") { lxGuideRate = SIDEREAL_RATE * 1.0f;
-    } else if (cmd == "RC") { lxGuideRate = SIDEREAL_RATE * 8.0f;
-    } else if (cmd == "RM") { lxGuideRate = SIDEREAL_RATE * 20.0f;
-    } else if (cmd == "RF") { lxGuideRate = SIDEREAL_RATE * 48.0f;
-    } else if (cmd == "RS") { lxGuideRate = SIDEREAL_RATE * 120.0f;
-    } else if (cmd.startsWith("R") && cmd.length()==2 && isDigit(cmd.charAt(1))) {
-        const float tbl[] = {0.5f,1.f,2.f,4.f,8.f,16.f,24.f,48.f,120.f,240.f};
-        lxGuideRate = SIDEREAL_RATE * tbl[cmd.charAt(1)-'0'];
+    } else if (cmd == "RG" || cmd == "RC" || cmd == "RM" || cmd == "RF" || cmd == "RS"
+            || (cmd.startsWith("R") && cmd.length()==2 && isDigit(cmd.charAt(1)))) {
+        char c = cmd.charAt(1);
+        lxRateIndex = c=='G' ? 2 : c=='C' ? 5 : c=='M' ? 6 : c=='F' ? 7 : c=='S' ? 8 : c-'0';
+        lxGuideRate = SIDEREAL_RATE * LX_RATES[lxRateIndex];
 
     // ── Pulse guide (:Mgd[n]# :MGd[n]#) ─────────────────────────────────
     // lx200driver: SendPulseCmd  → 0/1
@@ -1817,15 +1860,42 @@ void lxProcessCommand(const String& cmd) {
         sprintf(buf, "%.2f#", lxGuideRate / SIDEREAL_RATE);
         lxSend(String(buf));
 
+    // ── Запросы INDI lx200_OnStep без своей функции в прошивке ──────────
+    // По сети драйвер ждёт каждый ответ 2 с, а на молчание :%BD#/:%BR#/:GX95#/
+    // :GX96#/:A?# прерывает опрос — без ответов он почти ничего не обновляет.
+    } else if (cmd == "FA" || cmd == "fA"
+            || (cmd.length() == 3 && cmd.charAt(0) == 'F' && isDigit(cmd.charAt(1)) && cmd.charAt(2) == 'A')) {
+        lxSend("0");                // фокусёра нет (один символ, без #)
+    } else if (cmd == "GXY0") {
+        lxSend("00000000#");        // выходов (features) нет
+    } else if (cmd == "%BD" || cmd == "%BR") {
+        lxSend("0#");               // люфт, угл. секунды
+    } else if (cmd == "GX95") {
+        lxSend("0#");               // авто-переворот через меридиан выключен
+    } else if (cmd == "GX96") {
+        lxSend("B#");               // предпочтительная сторона опоры: лучшая
+    } else if (cmd == "A?") {
+        lxSend("000#");             // выравнивание по звёздам: нет
+    } else if (cmd == "$QZ?") {
+        lxSend("I#");               // PEC: ignore
+    } else if (cmd == "GXEM") {
+        lxSend("E#");               // тип монтировки: немецкая (GEM)
+
     // ── Status (:GU# :Gu# :GW# :Gm#) ────────────────────────────────────
     // lx200driver: нет прямого макроса, но checkLX200EquatorialFormat/GW
     } else if (cmd == "GU") {
-        // P/p=park, T/I=tracking, S/s=slewing, N=not aligned
+        // Формат OnStep (так его разбирает INDI lx200_OnStep):
+        // n=не ведёт, N=нет GoTo, P/p=запаркована/нет, E=немецкая монтировка,
+        // предпоследний символ — индекс скорости :Rn#, последний — код ошибки.
+        // Нельзя слать I (парковка идёт), T/W (сторона опоры), S (PPS), s (одна ось).
         String s = "";
-        s += (isParked        ? "P" : "p");
-        s += (trackingEnabled ? "T" : "I");
-        s += (isSlewing       ? "S" : "s");
-        s += "N#";
+        if (!trackingEnabled) s += 'n';
+        if (!isSlewing)       s += 'N';
+        s += (isParked ? 'P' : 'p');
+        s += 'E';
+        s += '/';                   // PEC не используется (драйвер не шлёт :$QZ?#)
+        s += char('0' + lxRateIndex);
+        s += "0#";
         lxSend(s);
 
     } else if (cmd == "Gu") {
