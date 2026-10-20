@@ -203,6 +203,14 @@ uint8_t lxRateIndex   = 2;
 float lxGuideRate     = SIDEREAL_RATE; // °/сек (1× sidereal по умолчанию)
 bool  lxHighPrecision = true;          // true = HH:MM:SS / +DD*MM:SS
 
+// Импульсное гидирование (:MgdNNNN#). RA — добавка к скорости до конца импульса.
+// DEC — 81″ на шаг, импульсы короче шага: копим дробные шаги и делаем целые.
+const float   GUIDE_RATE_X  = 0.5f;    // скорость поправки, в кратных сидерической
+float         raGuideSpeed  = 0.0f;    // °/сек
+unsigned long raGuideEnd    = 0;
+float         decGuideAcc   = 0.0f;    // накопленные шаги DEC (механика, со знаком)
+bool          decGuideMove  = false;   // DEC доходит накопленные шаги
+
 // ============================================================
 //  Вспомогательные функции
 // ============================================================
@@ -272,6 +280,7 @@ void enableDEC(bool on) { digitalWrite(DEC_ENABLE_PIN, on ? LOW : HIGH); }
 
 void startSlewMech(double h, double d) {
     raManualSpeed = decManualSpeed = 0;
+    raGuideSpeed = 0; decGuideAcc = 0; decGuideMove = false;
     enableRA(true);
     enableDEC(true);
     stepperRA .setSpeed(0);
@@ -1084,12 +1093,14 @@ void loop() {
         tmcCheck(drvDEC, decDrvOk, "DEC", DEC_CURRENT_MA);
     }
 
-    // — RA: GoTo (run() с разгоном) или постоянная скорость (трекинг + джог) —
+    if (raGuideSpeed != 0.0f && (long)(now - raGuideEnd) >= 0) raGuideSpeed = 0.0f;
+
+    // — RA: GoTo (run() с разгоном) или постоянная скорость (трекинг + джог + гидирование) —
     if (raSlew) {
         if (!stepperRA.run()) raSlew = false;
         raStopTime = now;
     } else {
-        float sps = raManualSpeed * RA_STEPS_PER_DEG * RA_DIR;
+        float sps = (raManualSpeed + raGuideSpeed) * RA_STEPS_PER_DEG * RA_DIR;
         if (trackingEnabled) sps += RA_SIDEREAL_SPEED * raSpeedMult * RA_DIR;
         if (sps != 0.0f) {
             enableRA(true);
@@ -1108,6 +1119,7 @@ void loop() {
         if (!stepperDEC.run()) decSlew = false;
         decStopTime = now;
     } else if (decManualSpeed != 0.0f) {
+        decGuideAcc = 0; decGuideMove = false;   // джог отменяет поправки гидирования
         enableDEC(true);
         stepperDEC.setSpeed(decManualSpeed * DEC_STEPS_PER_DEG * DEC_DIR);
         stepperDEC.runSpeed();
@@ -1117,6 +1129,17 @@ void loop() {
             long turn = lround(360.0 * DEC_STEPS_PER_DEG * DEC_DIR);
             stepperDEC.setCurrentPosition(stepperDEC.currentPosition() + (d > 270.0 ? -turn : turn));
         }
+        decMoving = true; decStopTime = now;
+    } else if (decGuideMove || fabs(decGuideAcc) >= 1.0f) {
+        // Гидирование DEC: накопился целый шаг — делаем его
+        if (!decGuideMove) {
+            long n = (long)decGuideAcc;
+            decGuideAcc -= n;
+            enableDEC(true);
+            stepperDEC.move(n * DEC_DIR);
+            decGuideMove = true;
+        }
+        if (!stepperDEC.run()) decGuideMove = false;
         decMoving = true; decStopTime = now;
     } else if (decMoving && now - decStopTime > MOTOR_OFF_DELAY) {
         decMoving = false;
@@ -1445,6 +1468,25 @@ void lxHandleTCP() {
 //  LX200 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ============================================================
 
+// Импульс гидирования: d = n/s/e/w на ms миллисекунд со скоростью GUIDE_RATE_X.
+// Запад — RA быстрее неба, восток — медленнее. Север/юг — по небу: за полюсом
+// (после переворота) механическое направление DEC обратное.
+bool startGuidePulse(char d, long ms) {
+    if (ms <= 0 || isSlewing || isParked) return false;
+    float v = SIDEREAL_RATE * GUIDE_RATE_X;
+    if (d == 'e' || d == 'w') {
+        enableRA(true);
+        raGuideSpeed = (d == 'w') ? v : -v;
+        raGuideEnd   = millis() + ms;
+    } else if (d == 'n' || d == 's') {
+        float sky = pierFlipped(mechDEC()) ? -1.0f : 1.0f;
+        decGuideAcc += ((d == 'n') ? v : -v) * sky * ms / 1000.0f * DEC_STEPS_PER_DEG;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 // Отправить ответ клиенту + дублировать в Serial
 void lxSend(const String& s) {
     if (lxClientConnected && lxTcpClient.connected())
@@ -1768,8 +1810,8 @@ void lxProcessCommand(const String& cmd) {
                           || cmd == "Qn" || cmd == "Qs") {
         bool doRA  = (cmd=="Q" || cmd=="Qe" || cmd=="Qw");
         bool doDEC = (cmd=="Q" || cmd=="Qn" || cmd=="Qs");
-        if (doRA)  raManualSpeed  = 0;
-        if (doDEC) decManualSpeed = 0;
+        if (doRA)  { raManualSpeed  = 0; raGuideSpeed = 0; }
+        if (doDEC) { decManualSpeed = 0; decGuideAcc  = 0; }
         if (cmd == "Q") haltSlew();
         // нет ответа
 
@@ -1849,15 +1891,16 @@ void lxProcessCommand(const String& cmd) {
         lxRateIndex = c=='G' ? 2 : c=='C' ? 5 : c=='M' ? 6 : c=='F' ? 7 : c=='S' ? 8 : c-'0';
         lxGuideRate = SIDEREAL_RATE * LX_RATES[lxRateIndex];
 
-    // ── Pulse guide (:Mgd[n]# :MGd[n]#) ─────────────────────────────────
-    // lx200driver: SendPulseCmd  → 0/1
-    } else if (cmd.startsWith("Mgd") || cmd.startsWith("MGd")) {
-        lxSend("1");
+    // ── Pulse guide (:MgdNNNN# :MGdNNNN#), d = n/s/e/w, NNNN — мс ───────
+    // lx200driver: SendPulseCmd → :Mgd без ответа; :MGd (OnStep) отвечает 1
+    } else if ((cmd.startsWith("Mg") || cmd.startsWith("MG")) && cmd.length() >= 4) {
+        bool ok = startGuidePulse(cmd.charAt(2), cmd.substring(3).toInt());
+        if (cmd.charAt(1) == 'G') lxSend(ok ? "1" : "0");
 
     // ── Pulse guide rate (:GX90#) ────────────────────────────────────────
     } else if (cmd == "GX90") {
         char buf[12];
-        sprintf(buf, "%.2f#", lxGuideRate / SIDEREAL_RATE);
+        sprintf(buf, "%.2f#", GUIDE_RATE_X);
         lxSend(String(buf));
 
     // ── Запросы INDI lx200_OnStep без своей функции в прошивке ──────────
