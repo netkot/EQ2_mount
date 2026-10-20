@@ -34,6 +34,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <coredecls.h>
+#include <EEPROM.h>
 
 // ============================================================
 //  WiFi
@@ -138,6 +139,7 @@ float  raSpeedMult     = 1.0f;    // множитель сидерической
 float  raManualSpeed   = 0.0f;    // °/сек, ручное RA
 float  decManualSpeed  = 0.0f;    // °/сек, ручное DEC
 bool   isParked        = false;
+bool   parkPending     = false;   // Park: оси идут в положение парковки
 bool   isSlewing       = false;
 bool   raSlew          = false;   // ось RA идёт по moveTo()/run()
 bool   decSlew         = false;   // ось DEC идёт по moveTo()/run()
@@ -279,12 +281,18 @@ void enableRA (bool on) { digitalWrite(RA_ENABLE_PIN,  on ? LOW : HIGH); }
 void enableDEC(bool on) { digitalWrite(DEC_ENABLE_PIN, on ? LOW : HIGH); }
 
 void startSlewMech(double h, double d) {
+    parkPending = false;
     raManualSpeed = decManualSpeed = 0;
     raGuideSpeed = 0; decGuideAcc = 0; decGuideMove = false;
     enableRA(true);
     enableDEC(true);
     stepperRA .setSpeed(0);
     stepperDEC.setSpeed(0);
+    // moveTo() пересчитывает скорость, только если цель изменилась, а джог
+    // (runSpeed) цель не двигает: Park/GoTo в точку прежней цели после джога
+    // оставлял ось без скорости, и run() вечно ждал. Сначала цель = здесь.
+    stepperRA .moveTo(stepperRA .currentPosition());
+    stepperDEC.moveTo(stepperDEC.currentPosition());
     stepperRA .moveTo(lround(h * RA_STEPS_PER_DEG  * RA_DIR));
     stepperDEC.moveTo(lround(d * DEC_STEPS_PER_DEG * DEC_DIR));
     raSlew = decSlew = true;
@@ -323,6 +331,7 @@ bool startGoTo(double ra_deg, double dec_deg) {
 // Плавная остановка GoTo (с торможением)
 void haltSlew() {
     gotoPending = false;
+    parkPending = false;
     if (raSlew)  stepperRA .stop();
     if (decSlew) stepperDEC.stop();
 }
@@ -330,6 +339,7 @@ void haltSlew() {
 // Мгновенная остановка: сброс скорости и цели
 void abortSlew() {
     gotoPending = false;
+    parkPending = false;
     raSlew = decSlew = false;
     stepperRA .setCurrentPosition(stepperRA .currentPosition());
     stepperDEC.setCurrentPosition(stepperDEC.currentPosition());
@@ -363,11 +373,43 @@ void setHomePosition() {
     Serial.println(F("Home set (pole, counterweight down)"));
 }
 
+// Положение парковки — механические шаги осей. Хранится во флеше (EEPROM-
+// эмуляция), чтобы после выключения монтировка знала, где стоит.
+// Пока не сохранено (Set Park, :hQ#) — дом.
+struct ParkData { uint32_t magic; long ra; long dec; };
+const uint32_t PARK_MAGIC = 0x314B5250;   // "PRK1"
+long parkRA  = lround(HOME_HA_DEG * RA_STEPS_PER_DEG  * RA_DIR);
+long parkDEC = lround(90.0        * DEC_STEPS_PER_DEG * DEC_DIR);
+
+bool loadPark() {
+    ParkData p;
+    EEPROM.get(0, p);
+    if (p.magic != PARK_MAGIC) return false;
+    parkRA = p.ra; parkDEC = p.dec;
+    return true;
+}
+
+// Запомнить текущее положение как парковку. Не во время движения осей.
+bool savePark() {
+    if (isSlewing) return false;
+    parkRA  = stepperRA .currentPosition();
+    parkDEC = stepperDEC.currentPosition();
+    ParkData p = { PARK_MAGIC, parkRA, parkDEC };
+    EEPROM.put(0, p);
+    bool ok = EEPROM.commit();
+    Serial.printf("Park saved: HA=%.4f° DEC=%.4f° (mech) %s\n",
+                  parkRA / (double)(RA_STEPS_PER_DEG * RA_DIR),
+                  parkDEC / (DEC_STEPS_PER_DEG * DEC_DIR), ok ? "OK" : "FAILED");
+    return ok;
+}
+
+// Увести оси в положение парковки; isParked ставит loop(), когда оси дойдут
 void parkMount() {
     trackingEnabled = false;
     gotoPending     = false;
-    startSlewMech(HOME_HA_DEG, 90.0);
-    isParked = true;
+    startSlewMech(parkRA  / (double)(RA_STEPS_PER_DEG * RA_DIR),
+                  parkDEC / (DEC_STEPS_PER_DEG * DEC_DIR));
+    parkPending = true;
 }
 
 // ============================================================
@@ -466,6 +508,8 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     .cell-C {grid-column:3;grid-row:3}
     .cell-e {grid-column:4;grid-row:3}  .cell-E{grid-column:5;grid-row:3}
     .cell-s {grid-column:3;grid-row:4}  .cell-D{grid-column:3;grid-row:5}
+    .cell-ne{grid-column:2;grid-row:2}  .cell-nw{grid-column:4;grid-row:2}
+    .cell-se{grid-column:2;grid-row:4}  .cell-sw{grid-column:4;grid-row:4}
 
     /* ── Info box ── */
     .ibox{background:rgba(0,0,0,0.22);border-radius:7px;
@@ -533,11 +577,23 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         <button class="btn-nav cell-W" title="На восток (RA+) со скоростью с ползунка, пока кнопка нажата"
           onmousedown="jog('ra',-1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jog('ra',-1)" ontouchend="jogStop('ra')">◄<small>E · RA+</small></button>
-        <button class="btn-nav fine cell-w" title="Медленно на запад (0.1°/с) — для центрирования"
+        <button class="btn-nav fine cell-w" title="Медленно на восток (0.1°/с) — для центрирования"
           onmousedown="jogFine('ra',-1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jogFine('ra',-1)" ontouchend="jogStop('ra')">◂<small>slow</small></button>
         <button class="btn-stop cell-C" onclick="stopAll()" title="Остановить всё с торможением: GoTo, джог и трекинг">■</button>
-        <button class="btn-nav fine cell-e" title="Медленно на восток (0.1°/с) — для центрирования"
+        <button class="btn-nav fine cell-ne" title="Медленно на северо-восток: обе оси сразу, под 45° на небе"
+          onmousedown="jogDiag(-1,1)" onmouseup="jogStopBoth()" onmouseleave="if(event.buttons)jogStopBoth()"
+          ontouchstart="jogDiag(-1,1)" ontouchend="jogStopBoth()">◤<small>N·E</small></button>
+        <button class="btn-nav fine cell-nw" title="Медленно на северо-запад: обе оси сразу, под 45° на небе"
+          onmousedown="jogDiag(1,1)" onmouseup="jogStopBoth()" onmouseleave="if(event.buttons)jogStopBoth()"
+          ontouchstart="jogDiag(1,1)" ontouchend="jogStopBoth()">◥<small>N·W</small></button>
+        <button class="btn-nav fine cell-se" title="Медленно на юго-восток: обе оси сразу, под 45° на небе"
+          onmousedown="jogDiag(-1,-1)" onmouseup="jogStopBoth()" onmouseleave="if(event.buttons)jogStopBoth()"
+          ontouchstart="jogDiag(-1,-1)" ontouchend="jogStopBoth()">◣<small>S·E</small></button>
+        <button class="btn-nav fine cell-sw" title="Медленно на юго-запад: обе оси сразу, под 45° на небе"
+          onmousedown="jogDiag(1,-1)" onmouseup="jogStopBoth()" onmouseleave="if(event.buttons)jogStopBoth()"
+          ontouchstart="jogDiag(1,-1)" ontouchend="jogStopBoth()">◢<small>S·W</small></button>
+        <button class="btn-nav fine cell-e" title="Медленно на запад (0.1°/с) — для центрирования"
           onmousedown="jogFine('ra',1)" onmouseup="jogStop('ra')" onmouseleave="if(event.buttons)jogStop('ra')"
           ontouchstart="jogFine('ra',1)" ontouchend="jogStop('ra')">▸<small>slow</small></button>
         <button class="btn-nav cell-E" title="На запад (RA−) со скоростью с ползунка, пока кнопка нажата"
@@ -578,8 +634,8 @@ const char htmlPage[] PROGMEM = R"rawliteral(
       </div>
       <button class="btn-goto" onclick="doGoTo()" title="Навести трубу на RA/DEC из полей; сторона опоры выбирается так, чтобы противовес был внизу" style="margin-top:8px">🚀 Go To</button>
       <div class="g3">
-        <button class="btn-muted" onclick="setHome()" title="Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее">⌂ Set Home</button>
-        <button class="btn-muted" onclick="polarSet()" title="Как Set Home, плюс подставить в поля текущие координаты полюса">✦ Polar Set</button>
+        <button class="btn-muted" onclick="setPark()" title="Запомнить текущее положение трубы как парковку (во флеш, сохраняется после выключения); Park возвращает сюда">🅿 Set Park</button>
+        <button class="btn-muted" onclick="polarSet()" title="Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее и подставить в поля координаты полюса">✦ Polar Set</button>
         <button class="btn-muted" onclick="doSync()" title="Труба смотрит на объект с RA/DEC из полей: привязать координаты к нему (центрировать звезду, потом Sync)">⟳ Sync</button>
       </div>
     </div>
@@ -592,7 +648,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     </div>
     <div class="card-body">
       <div class="g2">
-        <button class="btn-warn" onclick="doPark()" title="Выключить трекинг и увести трубу в дом (противовес вниз, труба на полюс)">Park</button>
+        <button class="btn-warn" onclick="doPark()" title="Выключить трекинг, увести трубу в положение парковки (Set Park) и пометить монтировку запаркованной">Park</button>
         <button class="btn-muted" onclick="doUnpark()" title="Снять отметку «запаркована» — разрешить GoTo из планетариев">Unpark</button>
       </div>
       <div style="display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap">
@@ -673,11 +729,12 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         <tr><td><b>■</b></td><td>Остановить всё с торможением: GoTo, джог и трекинг</td></tr>
         <tr><td><b>▲ ▼ ◄ ►</b></td><td>Движение по N/S/E/W со скоростью с ползунка, пока кнопка нажата</td></tr>
         <tr><td><b>▴ ▾ ◂ ▸ (slow)</b></td><td>Медленное движение 0.1°/с — для центрирования звезды</td></tr>
+        <tr><td><b>◤ ◥ ◣ ◢</b></td><td>Медленно по диагонали, обе оси сразу: RA 0.1°/с, DEC медленнее в cos(DEC) раз — на небе выходит 45°</td></tr>
         <tr><td><b>🚀 Go To</b></td><td>Навести трубу на RA/DEC из полей; сторона опоры выбирается так, чтобы противовес был внизу</td></tr>
-        <tr><td><b>⌂ Set Home</b></td><td>Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее</td></tr>
-        <tr><td><b>✦ Polar Set</b></td><td>Как Set Home, плюс подставить в поля текущие координаты полюса</td></tr>
+        <tr><td><b>🅿 Set Park</b></td><td>Запомнить текущее положение трубы как парковку — во флеш, сохраняется после выключения. После включения монтировка считает, что стоит в парковке</td></tr>
+        <tr><td><b>✦ Polar Set</b></td><td>Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее и подставить в поля координаты полюса</td></tr>
         <tr><td><b>⟳ Sync</b></td><td>Труба смотрит на объект с RA/DEC из полей: привязать координаты к нему (центрировать звезду, потом Sync)</td></tr>
-        <tr><td><b>Park</b></td><td>Выключить трекинг и увести трубу в дом (противовес вниз, труба на полюс)</td></tr>
+        <tr><td><b>Park</b></td><td>Выключить трекинг, увести трубу в положение парковки (Set Park; пока не задано — дом) и, когда дойдёт, пометить запаркованной</td></tr>
         <tr><td><b>Unpark</b></td><td>Снять отметку «запаркована» — разрешить GoTo из планетариев</td></tr>
         <tr><td><b>DEC Hold</b></td><td>Держать мотор DEC под током после остановки, чтобы ось не проседала</td></tr>
         <tr><td><b>Apply RA / DEC</b></td><td>Применить макс. скорость и ускорение оси (до перезагрузки)</td></tr>
@@ -706,7 +763,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
 </div><!-- /container -->
 
 <script>
-var trackOn=false, timeSent=false;
+var trackOn=false, timeSent=false, curDec=0;
 function fmt(v,d){return Number(v).toFixed(d||4);}
 function hms(deg){var s=Math.round(((deg%360+360)%360)/15*3600)%86400;
   return [s/3600|0,(s/60|0)%60,s%60].map(x=>('0'+x).slice(-2)).join(':');}
@@ -723,6 +780,7 @@ function poll(){
     document.getElementById('raVal').innerText=fmt(d.ra_deg);
     document.getElementById('raHms').innerText=hms(d.ra_deg).replace(/(\d+):(\d+):(\d+)/,'$1h$2m$3s');
     document.getElementById('decVal').innerText=fmt(d.dec_deg);
+    curDec=d.dec_deg;
     document.getElementById('statusBox').innerHTML=
       '<b>Tracking:</b> '+(d.tracking?'<span style="color:#10b981">ON</span>':'OFF')+
       ' &nbsp;|&nbsp; <b>Slewing:</b> '+(d.slewing?'<span style="color:#f59e0b">YES</span>':'NO')+
@@ -788,6 +846,14 @@ function jog(axis,dir){
 var JOG_FINE=0.1;
 function jogFine(axis,dir){fetch('/jog?axis='+axis+'&speed='+(dir*JOG_FINE));}
 function jogStop(axis){fetch('/jog?axis='+axis+'&speed=0');}
+// Диагональ: на небе RA проходит в cos(DEC) раз меньше, чем те же °/с по DEC
+// (у полюса — в десятки раз), поэтому DEC замедляем, чтобы выходило 45°.
+// Не меньше 0.1: у самого полюса направления RA нет, DEC иначе почти стоит.
+function jogDiag(ra,dec){
+  var k=Math.max(Math.cos(curDec*Math.PI/180),0.1);
+  fetch('/jog?ra='+(ra*JOG_FINE)+'&dec='+(dec*JOG_FINE*k).toFixed(4));
+}
+function jogStopBoth(){fetch('/jog?ra=0&dec=0');}
 function stopAll(){fetch('/stop-all').then(poll);}
 
 /* ── GoTo ── */
@@ -838,8 +904,10 @@ function doGoTo(){
   fetch('/goto?ra='+ra+'&dec='+dec)
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
-function setHome(){fetch('/set-home').then(poll);}
-/* Труба на полюсе (противовес вниз): то же положение, что Set Home,
+function setPark(){
+  fetch('/set-park').then(r=>r.text()).then(t=>{alert(t=='OK'?'Положение парковки сохранено':t);poll();});
+}
+/* Труба на полюсе (противовес вниз): принять это положение за дом,
    плюс текущие координаты полюса в поля GoTo/Sync. Планетарии увидят
    новую позицию при следующем опросе (:GR#/:GD#, /api/get). */
 function polarSet(){
@@ -1013,7 +1081,17 @@ void setup() {
 
     stepperRA .setMaxSpeed(raMaxSpeed);  stepperRA .setAcceleration(raAccel);
     stepperDEC.setMaxSpeed(decMaxSpeed); stepperDEC.setAcceleration(decAccel);
-    setHomePosition();   // после включения монтировка считается в доме
+    // После включения монтировка считается в положении парковки (если оно
+    // сохранено — её паркуют перед выключением) и запаркованной; иначе в доме.
+    EEPROM.begin(sizeof(ParkData));
+    if (loadPark()) {
+        stepperRA .setCurrentPosition(parkRA);
+        stepperDEC.setCurrentPosition(parkDEC);
+        isParked = true;
+        Serial.println(F("Position: saved park, parked"));
+    } else {
+        setHomePosition();
+    }
 
     // Режим не пишем во флеш: иначе после запуска точки доступа ESP так и
     // остаётся в AP+STA и радио прыгает по каналам. Сон модема выключаем —
@@ -1052,6 +1130,7 @@ void setup() {
     server.on("/goto",     HTTP_GET, handleGoTo);
     server.on("/sync",     HTTP_GET, handleSync);
     server.on("/set-home", HTTP_GET, handleSetHome);
+    server.on("/set-park", HTTP_GET, handleSetPark);
     server.on("/set-time", HTTP_GET, handleSetTime);
     server.on("/park",     HTTP_GET, handlePark);
     server.on("/unpark",   HTTP_GET, handleUnpark);
@@ -1159,6 +1238,13 @@ void loop() {
 
     isSlewing = raSlew || decSlew || gotoPending;
 
+    // — Park: оси дошли до положения парковки —
+    if (parkPending && !isSlewing) {
+        parkPending = false;
+        isParked    = true;
+        Serial.println(F("Parked"));
+    }
+
     updateCurrentCoords();
     lxHandleTCP();
 }
@@ -1221,13 +1307,15 @@ void handleRASpeed() {
 void handleJog() {
     String axis = server.hasArg("axis")  ? server.arg("axis")  : "";
     float  spd  = server.hasArg("speed") ? server.arg("speed").toFloat() : 0;
-    // RA: + на запад (механически), DEC: + на север (по небу)
-    if (spd != 0) haltSlew();
-    if (axis == "ra") {
-        raManualSpeed = spd;  raStopTime  = millis();
-    } else if (axis == "dec") {
-        decManualSpeed = spd; decStopTime = millis();
-    }
+    // RA: + на запад (механически), DEC: + в одну сторону оси (механически).
+    // ?axis=ra|dec&speed= — одна ось; ?ra=&dec= — обе сразу (диагональ)
+    bool hasRA = axis == "ra"  || server.hasArg("ra");
+    bool hasDE = axis == "dec" || server.hasArg("dec");
+    float raSpd  = server.hasArg("ra")  ? server.arg("ra").toFloat()  : spd;
+    float decSpd = server.hasArg("dec") ? server.arg("dec").toFloat() : spd;
+    if ((hasRA && raSpd != 0) || (hasDE && decSpd != 0)) haltSlew();
+    if (hasRA) { raManualSpeed  = raSpd;  raStopTime  = millis(); }
+    if (hasDE) { decManualSpeed = decSpd; decStopTime = millis(); }
     server.send(200, "text/plain", "OK");
 }
 
@@ -1264,6 +1352,12 @@ void handleSync() {
 void handleSetHome() {
     setHomePosition();
     server.send(200, "text/plain", "OK");
+}
+
+void handleSetPark() {
+    if (isSlewing)       server.send(200, "text/plain", "Монтировка движется — дождитесь остановки");
+    else if (savePark()) server.send(200, "text/plain", "OK");
+    else                 server.send(200, "text/plain", "Ошибка записи во флеш");
 }
 
 // GET /set-time?ms=<unix ms> — время из браузера, если нет NTP
@@ -1861,7 +1955,7 @@ void lxProcessCommand(const String& cmd) {
         // нет ответа
 
     } else if (cmd == "hQ") {
-        lxSend("1");  // "set park pos" — запоминаем текущую (в ОЗУ)
+        lxSend(savePark() ? "1" : "0");  // текущее положение — парковка (во флеш)
 
     } else if (cmd.startsWith("hA")) {
         // :hAn# — auto home state (нет ответа)
@@ -1928,13 +2022,14 @@ void lxProcessCommand(const String& cmd) {
     // lx200driver: нет прямого макроса, но checkLX200EquatorialFormat/GW
     } else if (cmd == "GU") {
         // Формат OnStep (так его разбирает INDI lx200_OnStep):
-        // n=не ведёт, N=нет GoTo, P/p=запаркована/нет, E=немецкая монтировка,
-        // предпоследний символ — индекс скорости :Rn#, последний — код ошибки.
-        // Нельзя слать I (парковка идёт), T/W (сторона опоры), S (PPS), s (одна ось).
+        // n=не ведёт, N=нет GoTo, P/p=запаркована/нет, I=парковка идёт,
+        // E=немецкая монтировка, предпоследний символ — индекс скорости :Rn#,
+        // последний — код ошибки. Нельзя слать T/W (сторона опоры), S (PPS), s (одна ось).
         String s = "";
         if (!trackingEnabled) s += 'n';
         if (!isSlewing)       s += 'N';
         s += (isParked ? 'P' : 'p');
+        if (parkPending)      s += 'I';
         s += 'E';
         s += '/';                   // PEC не используется (драйвер не шлёт :$QZ?#)
         s += char('0' + lxRateIndex);
