@@ -359,6 +359,15 @@ void abortSlew() {
     stepperDEC.setCurrentPosition(stepperDEC.currentPosition());
 }
 
+// Принять механическое положение осей (h, d) за текущее
+void syncMech(double ha, double dec, double h1, double d1) {
+    abortSlew();
+    stepperRA .setCurrentPosition(lround(h1 * RA_STEPS_PER_DEG  * RA_DIR));
+    stepperDEC.setCurrentPosition(lround(d1 * DEC_STEPS_PER_DEG * DEC_DIR));
+    Serial.printf("Sync → HA=%.4f° DEC=%.4f° (HA mech=%.4f° DEC mech=%.4f°)\n",
+                  ha, dec, h1, d1);
+}
+
 // Монтировка смотрит на (HA, DEC). Сторона опоры — ближайшая к текущей.
 void syncHaDec(double ha, double dec) {
     double h = mechHA(), d = mechDEC();
@@ -366,11 +375,7 @@ void syncHaDec(double ha, double dec) {
     haDecToMech(ha, dec, false, h, h1, d1);
     haDecToMech(ha, dec, true,  h, h2, d2);
     if (fabs(h2 - h) + fabs(d2 - d) < fabs(h1 - h) + fabs(d1 - d)) { h1 = h2; d1 = d2; }
-    abortSlew();
-    stepperRA .setCurrentPosition(lround(h1 * RA_STEPS_PER_DEG  * RA_DIR));
-    stepperDEC.setCurrentPosition(lround(d1 * DEC_STEPS_PER_DEG * DEC_DIR));
-    Serial.printf("Sync → HA=%.4f° DEC=%.4f° (HA mech=%.4f° DEC mech=%.4f°)\n",
-                  ha, dec, h1, d1);
+    syncMech(ha, dec, h1, d1);
 }
 
 // Sync: монтировка смотрит на (RA, DEC).
@@ -385,11 +390,15 @@ bool syncTo(double ra_deg, double dec_deg) {
 }
 
 // Ориентир неподвижен: трекинг выключаем, иначе труба уйдёт с него.
-// Труба наведена на антенну, значит уже не в парковке.
+// Труба наведена на антенну, значит уже не в парковке. Сторона опоры — как
+// у GoTo (противовес внизу): к ориентиру приходят джогом из неизвестного
+// положения, и «ближайшая к счётчику» сторона бывает перевёрнутой.
 void syncLandmark() {
     trackingEnabled = false;
     isParked        = false;
-    syncHaDec(LANDMARK_HA_DEG, LANDMARK_DEC_DEG);
+    double h, d;
+    gotoMech(LANDMARK_HA_DEG, LANDMARK_DEC_DEG, h, d);
+    syncMech(LANDMARK_HA_DEG, LANDMARK_DEC_DEG, h, d);
 }
 
 void gotoLandmark() {
@@ -2025,11 +2034,10 @@ void lxProcessCommand(const String& cmd) {
     } else if (cmd == "Mw") {
         enableRA(true);  raManualSpeed  =  lxGuideRate;
         raMoving=true;   raStopTime=millis();
-    } else if (cmd == "Mn") {
-        enableDEC(true); decManualSpeed =  lxGuideRate;
-        decMoving=true;  decStopTime=millis();
-    } else if (cmd == "Ms") {
-        enableDEC(true); decManualSpeed = -lxGuideRate;
+    // N/S — по небу: за полюсом механический DEC+ уводит на юг
+    } else if (cmd == "Mn" || cmd == "Ms") {
+        float sky = pierFlipped(mechDEC()) ? -1.0f : 1.0f;
+        enableDEC(true); decManualSpeed = (cmd == "Mn" ? lxGuideRate : -lxGuideRate) * sky;
         decMoving=true;  decStopTime=millis();
     } else if (cmd == "Mp") {
         // spiral search — не реализовано
