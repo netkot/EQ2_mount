@@ -85,6 +85,11 @@ const int   DEC_DIR =  1;
 const double HOME_HA_DEG  = -90.0;
 // GoTo ниже этой высоты над горизонтом не выполняется, градусы
 const double GOTO_MIN_ALT = 0.0;
+// Наземный ориентир для привязки без звёзд: антенна на 10 этаже соседнего
+// дома (102.4 м, азимут 146.7°, высота 4.7° с 7 этажа, широта 50.46°).
+// Неподвижен, поэтому задан часовым углом, а не RA: время не нужно.
+const double LANDMARK_HA_DEG  = -38.23;   // к востоку от меридиана = 21h27m05s
+const double LANDMARK_DEC_DEG = -27.85;   // −27°51′
 
 // ============================================================
 //  Объекты
@@ -256,13 +261,24 @@ void mechToEq(double h, double d, double& ra, double& dec) {
     ra = wrap360(lstDeg() - ha);
 }
 
-// Механическая позиция для (RA, DEC) на нужной стороне опоры;
+// Механическая позиция для (HA, DEC) на нужной стороне опоры;
 // h берётся ближайшим к refH (без лишних оборотов оси)
-void eqToMech(double ra, double dec, bool flip, double refH, double& h, double& d) {
-    double ha = lstDeg() - ra;
+void haDecToMech(double ha, double dec, bool flip, double refH, double& h, double& d) {
     d = dec;
     if (flip) { ha += 180.0; d = 180.0 - dec; }
     h = refH + wrap180(ha - refH);
+}
+
+void eqToMech(double ra, double dec, bool flip, double refH, double& h, double& d) {
+    haDecToMech(lstDeg() - ra, dec, flip, refH, h, d);
+}
+
+// Сторона опоры для GoTo — та, где противовес ниже оси RA (|h − HOME_HA_DEG| ≤ 90°)
+void gotoMech(double ha, double dec, double& h, double& d) {
+    double hf, df;
+    haDecToMech(ha, dec, false, HOME_HA_DEG, h,  d);
+    haDecToMech(ha, dec, true,  HOME_HA_DEG, hf, df);
+    if (fabs(hf - HOME_HA_DEG) < fabs(h - HOME_HA_DEG)) { h = hf; d = df; }
 }
 
 void altAz(double ra, double dec, double& alt, double& az) {
@@ -316,10 +332,8 @@ bool startGoTo(double ra_deg, double dec_deg) {
     }
     targetRA_deg  = ra_deg;
     targetDEC_deg = dec_deg;
-    double h, d, hf, df;
-    eqToMech(ra_deg, dec_deg, false, HOME_HA_DEG, h,  d);
-    eqToMech(ra_deg, dec_deg, true,  HOME_HA_DEG, hf, df);
-    if (fabs(hf - HOME_HA_DEG) < fabs(h - HOME_HA_DEG)) { h = hf; d = df; }
+    double h, d;
+    gotoMech(lstDeg() - ra_deg, dec_deg, h, d);
     startSlewMech(h, d);
     gotoPending = true;
     gotoPass    = 0;
@@ -345,24 +359,46 @@ void abortSlew() {
     stepperDEC.setCurrentPosition(stepperDEC.currentPosition());
 }
 
-// Sync: монтировка смотрит на (RA, DEC). Сторона опоры — ближайшая к текущей.
+// Монтировка смотрит на (HA, DEC). Сторона опоры — ближайшая к текущей.
+void syncHaDec(double ha, double dec) {
+    double h = mechHA(), d = mechDEC();
+    double h1, d1, h2, d2;
+    haDecToMech(ha, dec, false, h, h1, d1);
+    haDecToMech(ha, dec, true,  h, h2, d2);
+    if (fabs(h2 - h) + fabs(d2 - d) < fabs(h1 - h) + fabs(d1 - d)) { h1 = h2; d1 = d2; }
+    abortSlew();
+    stepperRA .setCurrentPosition(lround(h1 * RA_STEPS_PER_DEG  * RA_DIR));
+    stepperDEC.setCurrentPosition(lround(d1 * DEC_STEPS_PER_DEG * DEC_DIR));
+    Serial.printf("Sync → HA=%.4f° DEC=%.4f° (HA mech=%.4f° DEC mech=%.4f°)\n",
+                  ha, dec, h1, d1);
+}
+
+// Sync: монтировка смотрит на (RA, DEC).
 // false — время не задано (без LST привязка RA бессмысленна).
 bool syncTo(double ra_deg, double dec_deg) {
     if (!timeSource) {
         Serial.println(F("Sync refused: time not set"));
         return false;
     }
-    double h = mechHA(), d = mechDEC();
-    double h1, d1, h2, d2;
-    eqToMech(ra_deg, dec_deg, false, h, h1, d1);
-    eqToMech(ra_deg, dec_deg, true,  h, h2, d2);
-    if (fabs(h2 - h) + fabs(d2 - d) < fabs(h1 - h) + fabs(d1 - d)) { h1 = h2; d1 = d2; }
-    abortSlew();
-    stepperRA .setCurrentPosition(lround(h1 * RA_STEPS_PER_DEG  * RA_DIR));
-    stepperDEC.setCurrentPosition(lround(d1 * DEC_STEPS_PER_DEG * DEC_DIR));
-    Serial.printf("Sync → RA=%.4f° DEC=%.4f° (HA mech=%.4f° DEC mech=%.4f°)\n",
-                  ra_deg, dec_deg, h1, d1);
+    syncHaDec(lstDeg() - ra_deg, dec_deg);
     return true;
+}
+
+// Ориентир неподвижен: трекинг выключаем, иначе труба уйдёт с него.
+// Труба наведена на антенну, значит уже не в парковке.
+void syncLandmark() {
+    trackingEnabled = false;
+    isParked        = false;
+    syncHaDec(LANDMARK_HA_DEG, LANDMARK_DEC_DEG);
+}
+
+void gotoLandmark() {
+    trackingEnabled = false;
+    gotoPending     = false;
+    double h, d;
+    gotoMech(LANDMARK_HA_DEG, LANDMARK_DEC_DEG, h, d);
+    startSlewMech(h, d);
+    Serial.printf("GoTo landmark → HA mech=%.4f° DEC mech=%.4f°\n", h, d);
 }
 
 // Домашнее положение: противовес вниз, труба на полюс
@@ -638,6 +674,10 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         <button class="btn-muted" onclick="polarSet()" title="Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее и подставить в поля координаты полюса">✦ Polar Set</button>
         <button class="btn-muted" onclick="doSync()" title="Труба смотрит на объект с RA/DEC из полей: привязать координаты к нему (центрировать звезду, потом Sync)">⟳ Sync</button>
       </div>
+      <div class="g2" style="margin-top:8px">
+        <button class="btn-muted" onclick="landmark('sync')" title="Труба наведена на антенну (10 этаж, азимут 146.7°, высота 4.7°): привязать к ней координаты. Время не нужно, трекинг выключается">📡 Sync на антенну</button>
+        <button class="btn-muted" onclick="landmark('goto')" title="Навести трубу на антенну — проверить, не сбилась ли привязка. Трекинг выключается">📡 GoTo на антенну</button>
+      </div>
     </div>
   </div>
 
@@ -734,6 +774,8 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         <tr><td><b>🅿 Set Park</b></td><td>Запомнить текущее положение трубы как парковку — во флеш, сохраняется после выключения. После включения монтировка считает, что стоит в парковке</td></tr>
         <tr><td><b>✦ Polar Set</b></td><td>Монтировка в доме (противовес вниз, труба на полюс): принять это положение за текущее и подставить в поля координаты полюса</td></tr>
         <tr><td><b>⟳ Sync</b></td><td>Труба смотрит на объект с RA/DEC из полей: привязать координаты к нему (центрировать звезду, потом Sync)</td></tr>
+        <tr><td><b>📡 Sync на антенну</b></td><td>Труба наведена на антенну на 10 этаже (азимут 146.7°, высота 4.7°): привязать к ней координаты — днём, без звёзд и без времени. Трекинг выключается</td></tr>
+        <tr><td><b>📡 GoTo на антенну</b></td><td>Навести трубу на антенну, чтобы проверить привязку. Трекинг выключается</td></tr>
         <tr><td><b>Park</b></td><td>Выключить трекинг, увести трубу в положение парковки (Set Park; пока не задано — дом) и, когда дойдёт, пометить запаркованной</td></tr>
         <tr><td><b>Unpark</b></td><td>Снять отметку «запаркована» — разрешить GoTo из планетариев</td></tr>
         <tr><td><b>DEC Hold</b></td><td>Держать мотор DEC под током после остановки, чтобы ось не проседала</td></tr>
@@ -922,6 +964,11 @@ function doSync(){
   var ra=raDeg(), dec=decDeg(); if(ra===null||dec===null)return;
   fetch('/sync?ra='+ra+'&dec='+dec)
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
+}
+
+function landmark(a){
+  if(a=='sync'&&!confirm('Труба точно наведена на антенну?'))return;
+  fetch('/landmark?do='+a).then(poll);
 }
 
 /* ── Park ── */
@@ -1129,6 +1176,7 @@ void setup() {
     server.on("/stop-all", HTTP_GET, handleStopAll);
     server.on("/goto",     HTTP_GET, handleGoTo);
     server.on("/sync",     HTTP_GET, handleSync);
+    server.on("/landmark", HTTP_GET, handleLandmark);
     server.on("/set-home", HTTP_GET, handleSetHome);
     server.on("/set-park", HTTP_GET, handleSetPark);
     server.on("/set-time", HTTP_GET, handleSetTime);
@@ -1346,6 +1394,15 @@ void handleSync() {
             return;
         }
     }
+    server.send(200, "text/plain", "OK");
+}
+
+// GET /landmark?do=sync|goto — привязка к ориентиру / наведение на него
+void handleLandmark() {
+    String a = server.arg("do");
+    if      (a == "sync") syncLandmark();
+    else if (a == "goto") gotoLandmark();
+    else { server.send(400, "text/plain", "do=sync|goto"); return; }
     server.send(200, "text/plain", "OK");
 }
 
