@@ -672,6 +672,10 @@ const char htmlPage[] PROGMEM = R"rawliteral(
     .help td{padding:5px 6px;border-top:1px solid rgba(255,255,255,0.08);vertical-align:top}
     .help td:first-child{white-space:nowrap;color:#e2b96f}
     .g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+    .mview svg{width:100%;height:auto;display:block;background:rgba(0,0,0,0.25);border-radius:8px}
+    .mview .cap{font-size:12px;color:#888;text-align:center;margin-top:4px}
+    .mvals{font-size:13px;text-align:center;margin-top:8px;line-height:1.6}
+    .mvals b{color:#e2b96f;font-weight:600}
     @media(max-width:500px){.g2,.g3{grid-template-columns:1fr}}
 
     /* ── Координаты ── */
@@ -819,6 +823,20 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         <input type="range" id="jogSpeed" min="2" max="60" step="2" value="14"
                oninput="document.getElementById('jogVal').innerText=this.value">
       </div>
+    </div>
+  </div>
+
+  <!-- ═══ Схема монтировки (раскрываемая, открыта) ═════════════════════ -->
+  <div class="card">
+    <div class="card-hdr open" onclick="tog(this)">
+      <h2>📐 Положение монтировки</h2><span class="arr">▼</span>
+    </div>
+    <div class="card-body open">
+      <div class="g2">
+        <div class="mview"><svg id="mSide" viewBox="-150 -125 300 250"></svg><div class="cap">Сбоку (вид с запада)</div></div>
+        <div class="mview"><svg id="mTop"  viewBox="-150 -125 300 250"></svg><div class="cap">Сверху (север вверху)</div></div>
+      </div>
+      <div class="mvals" id="mVals">—</div>
     </div>
   </div>
 
@@ -1018,6 +1036,7 @@ function poll(){
     document.getElementById('rts2dot').className=
       'dot '+(d.tracking||d.slewing?'dot-g':'dot-r');
     if(typeof d.dec_hold!=='undefined') updateDecHoldUI(d.dec_hold);
+    if(d.mech_ha!=null) drawMount(d);
     var bad=[];
     if(d.ra_drv===false) bad.push('RA');
     if(d.dec_drv===false) bad.push('DEC');
@@ -1190,7 +1209,141 @@ function emergencyStop(){
   b.className='btn-track';
 }
 
+/* ── Схема монтировки ──
+   3D-модель в осях (восток, север, вверх), единица — длина половины трубы.
+   Ось RA смотрит на полюс; противовес — по оси DEC, в доме (mech HA = −90°)
+   вниз; труба: cos(d)·экватор(h) + sin(d)·полюс, при d > 90° — за полюс. */
+var RD=Math.PI/180, mPrev='', mFast=false;
+function eqv(H,d,lat){
+  H*=RD; d*=RD; var f=lat*RD;
+  return [-Math.cos(d)*Math.sin(H),
+          Math.sin(d)*Math.cos(f)-Math.cos(d)*Math.cos(H)*Math.sin(f),
+          Math.sin(d)*Math.sin(f)+Math.cos(d)*Math.cos(H)*Math.cos(f)];
+}
+function va(a,b,k){return [a[0]+b[0]*k,a[1]+b[1]*k,a[2]+b[2]*k];}
+var MS=55;   // пикселей на единицу
+// Виды: точка → [x, y, глубина к зрителю]
+var VIEWS={
+  side:function(v){return [-v[1]*MS, -v[2]*MS+15, -v[0]];}, // с запада: север влево
+  top: function(v){return [v[0]*MS, -v[1]*MS+10, v[2]];}    // сверху: север вверх, восток вправо
+};
+function f1(x){return x.toFixed(1);}
+function seg(a,b,w,col,cap){
+  return '<line x1="'+f1(a[0])+'" y1="'+f1(a[1])+'" x2="'+f1(b[0])+'" y2="'+f1(b[1])+'" stroke="'+col+'" stroke-width="'+w+'" stroke-linecap="'+(cap||'round')+'"/>';
+}
+// Дуга с красными стрелками от угла a1 к a2 (градусы экрана): короткой стороной,
+// а при cw — всегда по часовой (азимут от севера)
+function arc(c,r,a1,a2,label,cw){
+  var dl=cw?((a2-a1+720)%360):((a2-a1+540)%360)-180;
+  if(Math.abs(dl)<6||dl>354) return '';
+  // Линия дуги кончается у основания наконечника, остриё — точно в a1/a2
+  var hl=Math.min(15,r*Math.abs(dl)*RD*0.4), tr=hl/r/RD*(dl>0?1:-1);
+  function pt(a){return [c[0]+r*Math.cos(a*RD),c[1]+r*Math.sin(a*RD)];}
+  function head(tip,base){
+    var ux=tip[0]-base[0], uy=tip[1]-base[1], n=Math.hypot(ux,uy), w=hl*0.6;
+    ux/=n; uy/=n;
+    return '<polygon points="'+f1(tip[0])+','+f1(tip[1])+' '+f1(base[0]-uy*w)+','+f1(base[1]+ux*w)+' '+f1(base[0]+uy*w)+','+f1(base[1]-ux*w)+'" fill="#ff3b3b"/>';
+  }
+  var p1=pt(a1+tr), p2=pt(a2-tr), am=(a1+dl/2)*RD;
+  return '<path d="M'+f1(p1[0])+','+f1(p1[1])+' A'+r+','+r+' 0 '+(Math.abs(dl)-2*Math.abs(tr)>180?1:0)+' '+(dl>0?1:0)+' '+f1(p2[0])+','+f1(p2[1])+'" fill="none" stroke="#ff3b3b" stroke-width="5"/>'+
+    head(pt(a1),p1)+head(pt(a2),p2)+
+    '<text x="'+f1(c[0]+(r+24)*Math.cos(am))+'" y="'+f1(c[1]+(r+20)*Math.sin(am)+4)+'" fill="#ff5c5c" font-size="13" font-weight="600" text-anchor="middle" stroke="#0b1020" stroke-width="3" paint-order="stroke">'+label+'</text>';
+}
+// Труба: прямоугольник с градиентом поперёк, торцы; ближний к зрителю торец — эллипс
+function tube(b,f,full,w){
+  var dx=f[0]-b[0], dy=f[1]-b[1], L=Math.hypot(dx,dy), ang=Math.atan2(dy,dx)/RD;
+  var cx=(b[0]+f[0])/2, cy=(b[1]+f[1])/2, k=Math.min(L/full,1);
+  var s='<g transform="translate('+f1(cx)+','+f1(cy)+') rotate('+f1(ang)+')">'+
+    '<rect x="'+f1(-L/2)+'" y="'+(-w/2)+'" width="'+f1(L)+'" height="'+w+'" fill="url(#mTube)"/>';
+  if(L>40) s+='<rect x="'+f1(-L/2)+'" y="'+(-w/2)+'" width="9" height="'+w+'" fill="url(#mCap)"/>'+
+              '<rect x="'+f1(L/2-9)+'" y="'+(-w/2)+'" width="9" height="'+w+'" fill="url(#mCap)"/>';
+  var front=f[2]>b[2], rx=Math.max(w/2*Math.sqrt(1-k*k),1);
+  s+='<ellipse cx="'+f1(front?L/2:-L/2)+'" cy="0" rx="'+f1(rx)+'" ry="'+(w/2)+'" fill="'+(front?'#0b1020':'#555')+'" stroke="'+(front?'#5b6bff':'#999')+'" stroke-width="2"/>';
+  return s+'</g>';
+}
+// Синяя стрелка направления трубы; почти на зрителя — ⊙, от зрителя — ⊗
+function pointer(f,dir,full){
+  var L=Math.hypot(dir[0],dir[1]), k=L/full;
+  if(k<0.25){
+    var t=dir[2]>0;
+    return '<circle cx="'+f1(f[0])+'" cy="'+f1(f[1])+'" r="9" fill="none" stroke="#5b6bff" stroke-width="3"/>'+
+      (t?'<circle cx="'+f1(f[0])+'" cy="'+f1(f[1])+'" r="3" fill="#5b6bff"/>'
+        :seg([f[0]-5,f[1]-5],[f[0]+5,f[1]+5],3,'#5b6bff')+seg([f[0]-5,f[1]+5],[f[0]+5,f[1]-5],3,'#5b6bff'));
+  }
+  var ux=dir[0]/L, uy=dir[1]/L, n=40*k, e=[f[0]+ux*n,f[1]+uy*n];
+  return seg(f,e,8,'#5b6bff','butt')+
+    '<polygon points="'+f1(e[0]+ux*16)+','+f1(e[1]+uy*16)+' '+f1(e[0]-uy*11)+','+f1(e[1]+ux*11)+' '+f1(e[0]+uy*11)+','+f1(e[1]-ux*11)+'" fill="#5b6bff"/>';
+}
+var MDEFS='<defs>'+
+  '<linearGradient id="mTube" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#111"/>'+
+  '<stop offset=".3" stop-color="#f4f4f4"/><stop offset=".55" stop-color="#aaa"/><stop offset="1" stop-color="#111"/></linearGradient>'+
+  '<linearGradient id="mCap" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000"/>'+
+  '<stop offset=".4" stop-color="#888"/><stop offset="1" stop-color="#000"/></linearGradient>'+
+  '<linearGradient id="mRod" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#222"/>'+
+  '<stop offset=".5" stop-color="#ddd"/><stop offset="1" stop-color="#222"/></linearGradient></defs>';
+function drawView(id,pr,m,extra){
+  var P=m.P, items=[];
+  function it(z,svg){items.push([z,svg]);}
+  var A0=va([0,0,0],P,-0.45), A1=va([0,0,0],P,0.3), G=[A0[0],A0[1],-1.9];
+  var cw0=va(A1,m.cw,-0.25), cwE=va(A1,m.cw,1.15), W=va(A1,m.cw,0.95);
+  var T=va(A1,m.cw,-0.32), B=va(T,m.t,-0.95), F=va(T,m.t,1.0);
+  var pA0=pr(A0),pA1=pr(A1),pG=pr(G),pc0=pr(cw0),pcE=pr(cwE),pW=pr(W),pT=pr(T),pB=pr(B),pF=pr(F);
+  it((pG[2]+pA0[2])/2, seg(pG,pA0,10,'#666','butt'));                   // опора
+  it((pA0[2]+pA1[2])/2, seg(pA0,pA1,16,'#9aa','round'));               // ось RA
+  it((pA1[2]+pcE[2])/2-0.01, seg(pA1,pcE,6,'#bbb','round'));           // штанга
+  it(pW[2], '<circle cx="'+f1(pW[0])+'" cy="'+f1(pW[1])+'" r="13" fill="#444" stroke="#999" stroke-width="2"/>');
+  it((pc0[2]+pA1[2])/2+0.01, seg(pc0,pA1,13,'#778','round'));          // ось DEC
+  it(pT[2], tube(pB,pF,1.95*MS,26));
+  items.sort(function(a,b){return a[0]-b[0];});
+  var s=MDEFS+extra(pT,pF,pA0,pA1);
+  items.forEach(function(x){s+=x[1];});
+  s+=pointer(pF,[pF[0]-pB[0],pF[1]-pB[1],pF[2]-pB[2]],1.95*MS);
+  s+=m.arc(pT,pB,pF);
+  document.getElementById(id).innerHTML=s;
+}
+function drawMount(d){
+  var h=d.mech_ha, dm=d.mech_dec, lat=d.lat;
+  var P=eqv(0,90,lat), E=eqv(h,0,lat), cw=eqv(h-90,0,lat);
+  var t=[0,1,2].map(function(i){return Math.cos(dm*RD)*E[i]+Math.sin(dm*RD)*P[i];});
+  var m={P:P,cw:cw,t:t};
+  // Сбоку: горизонт, ось на полюс; дуга — высота над горизонтом
+  m.arc=function(pT,pB,pF){
+    var a2=Math.atan2(pF[1]-pB[1],pF[0]-pB[0])/RD, a1=(pF[0]>=pB[0])?0:180;
+    return arc(pT,72,a1,a2,'Alt '+d.alt.toFixed(1)+'°');
+  };
+  drawView('mSide',VIEWS.side,m,function(pT,pF,pA0,pA1){
+    var pole=VIEWS.side(va([0,0,0],P,2.4)), g=-1.9*MS*-1+15;
+    return '<line x1="-150" y1="'+g+'" x2="150" y2="'+g+'" stroke="#3a5" stroke-width="2"/>'+
+      '<line x1="-150" y1="'+f1(pT[1])+'" x2="150" y2="'+f1(pT[1])+'" stroke="#ff3b3b" stroke-width="1" stroke-dasharray="4 4" opacity=".6"/>'+
+      seg(pA0,pole,1,'#ff3b3b')+
+      '<text x="'+f1(pole[0]-4)+'" y="'+f1(pole[1]+4)+'" fill="#ff7b7b" font-size="11" text-anchor="end">полюс</text>'+
+      '<text x="-144" y="'+(g-6)+'" fill="#6c8" font-size="12">N</text>'+
+      '<text x="136" y="'+(g-6)+'" fill="#6c8" font-size="12">S</text>';
+  });
+  // Сверху: роза ветров; дуга — азимут от севера
+  m.arc=function(pT,pB,pF){
+    var a2=Math.atan2(pF[1]-pB[1],pF[0]-pB[0])/RD;
+    return arc(pT,72,-90,a2,'Az '+d.az.toFixed(1)+'°',true);
+  };
+  drawView('mTop',VIEWS.top,m,function(pT){
+    return '<line x1="'+f1(pT[0])+'" y1="-125" x2="'+f1(pT[0])+'" y2="'+f1(pT[1])+'" stroke="#ff3b3b" stroke-width="1" stroke-dasharray="4 4" opacity=".6"/>'+
+      '<text x="0" y="-110" fill="#6c8" font-size="13" text-anchor="middle">N</text>'+
+      '<text x="0" y="120" fill="#6c8" font-size="13" text-anchor="middle">S</text>'+
+      '<text x="140" y="5" fill="#6c8" font-size="13" text-anchor="middle">E</text>'+
+      '<text x="-140" y="5" fill="#6c8" font-size="13" text-anchor="middle">W</text>';
+  });
+  document.getElementById('mVals').innerHTML=
+    'Alt <b>'+d.alt.toFixed(1)+'°</b> · Az <b>'+d.az.toFixed(1)+'°</b> · Pier <b>'+d.pier+'</b>'+
+    '<br>Механика: HA <b>'+h.toFixed(2)+'°</b> · DEC <b>'+dm.toFixed(2)+'°</b>'+
+    (d.hall?' · <span style="color:#10b981">🧲 метка</span>':'');
+  // Пока оси движутся — опрашиваем чаще, чтобы схема шла плавно
+  var key=h.toFixed(3)+'/'+dm.toFixed(3);
+  mFast=d.slewing||(mPrev!==''&&key!==mPrev);
+  mPrev=key;
+}
+
 setInterval(poll,2000);
+setInterval(function(){if(mFast)poll();},400);
 poll();
 </script>
 </body>
@@ -1547,6 +1700,8 @@ void handleStatus() {
     j += "\"hall_in\":"    + (isnan(hallEnterDEC) ? String("null") : String(hallEnterDEC, 3)) + ",";
     j += "\"hall_out\":"   + (isnan(hallExitDEC)  ? String("null") : String(hallExitDEC,  3)) + ",";
     j += "\"mech_dec\":"   + String(mechDEC(), 3)        + ",";
+    j += "\"mech_ha\":"    + String(mechHA(), 3)         + ",";
+    j += "\"lat\":"        + String(obsLatitude_deg, 3)  + ",";
     j += "\"homing\":"     + String((int)homeState)      + ",";
     j += "\"hall_mark\":"  + String(hallMarkDEC, 3)      + ",";
     j += "\"home_msg\":\"" + homeMsg                     + "\",";
