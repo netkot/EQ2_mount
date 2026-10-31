@@ -194,6 +194,35 @@ unsigned long hallRawTime = 0;
 unsigned long hallEdges   = 0;
 double hallEnterDEC = NAN, hallExitDEC = NAN;
 
+// Привязка DEC по датчику: быстро до магнита, назад из зоны, медленно через
+// зону насквозь; середина зоны — метка с известным механическим DEC
+// (hallMarkDEC, магнит стоит в зоне парковки). Направление — к метке по
+// текущему счётчику (подсказка), окно поиска ограничено.
+enum HomeState { HOME_IDLE, HOME_FAST, HOME_BACK, HOME_SLOW, HOME_CENTER };
+HomeState homeState = HOME_IDLE;
+const float  HOME_FAST_SPEED = 6.0f;    // °/с, до магнита и назад
+const float  HOME_SLOW_SPEED = 1.0f;    // °/с, замер краёв зоны
+const double HOME_OVERSHOOT  = 30.0;    // ° за ожидаемой меткой, дальше не ищем
+const double HOME_BACKOFF    = 3.0;     // ° за краем зоны при отъезде
+const double HOME_MAX_ZONE   = 30.0;    // ° — зона шире значит неисправность
+int    homeDir   = 1;                   // механическое направление подхода
+double homeLimit = 0;                   // механический DEC, дальше которого не едем
+double homeA = NAN, homeB = NAN;        // края зоны (по старому счётчику)
+double homeShift = NAN;                 // на сколько поправили счётчик, °
+bool   homeCalibrate = false;           // только измерить метку, счётчик не трогать
+String homeMsg = "";                    // результат последнего поиска
+
+// Механический DEC середины зоны магнита. Измерен 2026-10-31 после Sync на
+// антенну; точное значение — калибровкой (/home-search?calibrate=1), во флеш.
+const double HALL_MARK_DEFAULT = 71.10;
+double hallMarkDEC = HALL_MARK_DEFAULT;
+
+void homeFail(const char* why) {
+    homeState = HOME_IDLE;
+    homeMsg   = String("Метка не найдена: ") + why;
+    Serial.println(homeMsg);
+}
+
 // ============================================================
 //  Настройки моторов
 // ============================================================
@@ -357,6 +386,7 @@ bool startGoTo(double ra_deg, double dec_deg) {
 
 // Плавная остановка GoTo (с торможением)
 void haltSlew() {
+    if (homeState != HOME_IDLE && homeState != HOME_CENTER) homeFail("остановлен");
     gotoPending = false;
     parkPending = false;
     if (raSlew)  stepperRA .stop();
@@ -365,6 +395,7 @@ void haltSlew() {
 
 // Мгновенная остановка: сброс скорости и цели
 void abortSlew() {
+    if (homeState != HOME_IDLE && homeState != HOME_CENTER) homeFail("прерван");
     gotoPending = false;
     parkPending = false;
     raSlew = decSlew = false;
@@ -429,6 +460,125 @@ void setHomePosition() {
     stepperRA .setCurrentPosition(lround(HOME_HA_DEG * RA_STEPS_PER_DEG  * RA_DIR));
     stepperDEC.setCurrentPosition(lround(90.0        * DEC_STEPS_PER_DEG * DEC_DIR));
     Serial.println(F("Home set (pole, counterweight down)"));
+}
+
+// Метка датчика во флеше — после записи парковки (ParkData < 32 байт)
+struct HallMarkData { uint32_t magic; double dec; };
+const uint32_t HALL_MAGIC = 0x314B4D48;   // "HMK1"
+const int      HALL_EEPROM_ADDR = 32;
+
+void loadHallMark() {
+    HallMarkData m;
+    EEPROM.get(HALL_EEPROM_ADDR, m);
+    if (m.magic == HALL_MAGIC && !isnan(m.dec)) hallMarkDEC = m.dec;
+}
+
+bool saveHallMark(double dec) {
+    hallMarkDEC = dec;
+    HallMarkData m = { HALL_MAGIC, dec };
+    EEPROM.put(HALL_EEPROM_ADDR, m);
+    return EEPROM.commit();
+}
+
+// Привязка DEC по датчику Холла. dir: +1/−1 — механическое направление,
+// 0 — к метке по текущему счётчику (из N-половины ниже метки это DEC+).
+// calibrate: счётчик верен (только что Sync) — измерить метку и сохранить.
+// Ось RA не трогаем: поправляется только счётчик DEC.
+double homeStage = 0;   // механический DEC в начале этапа
+double homeBackTo = NAN;
+
+bool startHomeSearch(int dir, bool calibrate) {
+    if (isSlewing) { homeMsg = "Монтировка движется — дождитесь остановки"; return false; }
+    double d = mechDEC();
+    homeDir   = dir ? (dir > 0 ? 1 : -1) : (d <= hallMarkDEC ? 1 : -1);
+    homeLimit = homeDir > 0 ? max(d, hallMarkDEC) + HOME_OVERSHOOT
+                            : min(d, hallMarkDEC) - HOME_OVERSHOOT;
+    decManualSpeed = 0; decGuideAcc = 0; decGuideMove = false;
+    isParked = false;
+    homeCalibrate = calibrate;
+    homeA = homeB = homeShift = homeBackTo = NAN;
+    homeStage = d;
+    homeState = hallActive ? HOME_BACK : HOME_FAST;
+    homeMsg   = calibrate ? "Калибровка метки…" : "Поиск метки…";
+    enableDEC(true);
+    Serial.printf("Hall search%s: from mech DEC %.3f, mark %.3f, dir %+d, limit %.1f\n",
+                  calibrate ? " (calibrate)" : "", d, hallMarkDEC, homeDir, homeLimit);
+    return true;
+}
+
+// Пройдено ли положение p по ходу s (+1 — по homeDir, −1 — против)
+bool homePassed(double p, int s) { return s * homeDir * (mechDEC() - p) >= 0; }
+
+void homeDrive(float speed, int s) {
+    stepperDEC.setSpeed(s * homeDir * speed * DEC_STEPS_PER_DEG * DEC_DIR);
+    stepperDEC.runSpeed();
+}
+
+// Один шаг автомата поиска; вызывается из loop() вместо джога DEC
+void homeSearchStep() {
+    switch (homeState) {
+    case HOME_FAST:
+        if (hallActive) { homeState = HOME_BACK; homeStage = mechDEC(); break; }
+        if (homePassed(homeLimit, 1)) { homeFail("магнита нет в окне поиска"); break; }
+        homeDrive(HOME_FAST_SPEED, 1);
+        break;
+    case HOME_BACK:
+        // Назад из зоны и ещё HOME_BACKOFF, чтобы замер начинался до края
+        if (isnan(homeBackTo) && !hallActive) homeBackTo = hallExitDEC - homeDir * HOME_BACKOFF;
+        if (!isnan(homeBackTo) && homePassed(homeBackTo, -1)) {
+            homeState = HOME_SLOW; homeStage = mechDEC(); break;
+        }
+        if (fabs(mechDEC() - homeStage) > HOME_MAX_ZONE + HOME_BACKOFF) {
+            homeFail("не выходит из зоны магнита"); break;
+        }
+        homeDrive(HOME_FAST_SPEED, -1);
+        break;
+    case HOME_SLOW:
+        if (isnan(homeA) && hallActive) homeA = hallEnterDEC;
+        if (!isnan(homeA) && !hallActive) {
+            homeB = hallExitDEC;
+            double c  = (homeA + homeB) / 2;
+            if (homeCalibrate) {
+                // Счётчик верен: середина зоны и есть метка
+                homeShift = c - hallMarkDEC;   // насколько сдвинулась метка
+                saveHallMark(c);
+            } else {
+                // Середина зоны по старому счётчику — это hallMarkDEC
+                homeShift = hallMarkDEC - c;
+                stepperDEC.setCurrentPosition(stepperDEC.currentPosition()
+                                              + lround(homeShift * DEC_STEPS_PER_DEG * DEC_DIR));
+            }
+            stepperDEC.moveTo(lround(hallMarkDEC * DEC_STEPS_PER_DEG * DEC_DIR));
+            decSlew   = true;
+            homeState = HOME_CENTER;
+            Serial.printf("Hall: zone %.3f..%.3f (%.3f°), mark %.3f, shift %+.3f°\n",
+                          homeA, homeB, fabs(homeB - homeA), hallMarkDEC, homeShift);
+            break;
+        }
+        if (isnan(homeA) && fabs(mechDEC() - homeStage) > HOME_BACKOFF + 10.0) {
+            homeFail("магнит потерян при медленном проходе"); break;
+        }
+        if (!isnan(homeA) && fabs(mechDEC() - homeA) > HOME_MAX_ZONE) {
+            homeFail("зона магнита слишком широкая"); break;
+        }
+        homeDrive(HOME_SLOW_SPEED, 1);
+        break;
+    case HOME_CENTER:
+        if (!decSlew) {
+            homeState = HOME_IDLE;
+            char buf[96];
+            if (homeCalibrate)
+                snprintf(buf, sizeof buf, "Метка сохранена: DEC %.2f° (сдвиг %+.2f°), зона %.2f°",
+                         hallMarkDEC, homeShift, fabs(homeB - homeA));
+            else
+                snprintf(buf, sizeof buf, "Метка найдена: поправка DEC %+.2f°, зона %.2f°",
+                         homeShift, fabs(homeB - homeA));
+            homeMsg = buf;
+            Serial.println(homeMsg);
+        }
+        break;
+    default: break;
+    }
 }
 
 // Положение парковки — механические шаги осей. Хранится во флеше (EEPROM-
@@ -700,6 +850,10 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         <button class="btn-muted" onclick="landmark('sync')" title="Труба наведена на антенну (10 этаж, азимут 146.7°, высота 4.7°): привязать к ней координаты. Время не нужно, трекинг выключается">📡 Sync на антенну</button>
         <button class="btn-muted" onclick="landmark('goto')" title="Навести трубу на антенну — проверить, не сбилась ли привязка. Трекинг выключается">📡 GoTo на антенну</button>
       </div>
+      <div class="g2" style="margin-top:8px">
+        <button class="btn-muted" onclick="homeSearch(0)" title="Привязать DEC по датчику Холла (магнит в зоне парковки): ось DEC едет к метке, находит края зоны и ставит в её середину сохранённый DEC метки. RA не меняется. Stop прерывает">🧲 Привязка по датчику</button>
+        <button class="btn-muted" onclick="homeSearch(1)" title="Координаты только что точно привязаны (Sync на антенну или звезду): найти середину зоны магнита и сохранить её DEC как метку (во флеш). Счётчик не меняется">🧲 Калибровать метку</button>
+      </div>
     </div>
   </div>
 
@@ -853,6 +1007,7 @@ function poll(){
       ' &nbsp;|&nbsp; <b>Pier:</b> '+d.pier+
       (d.hall!=null?' &nbsp;|&nbsp; <b>Hall:</b> '+(d.hall?'<span style="color:#10b981">MAGNET</span>':'clear')+
         ' ('+d.hall_edges+')':'')+
+      (d.home_msg?'<br><b>Датчик:</b> '+d.home_msg:'')+
       (d.time_ok?'':' &nbsp;|&nbsp; <span style="color:#f59e0b">⚠ время не задано</span>');
     if(!d.time_ok&&!timeSent){timeSent=true;fetch('/set-time?ms='+Date.now());}
     if(d.ip){
@@ -990,6 +1145,11 @@ function doSync(){
     .then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
 }
 
+function homeSearch(cal){
+  if(!confirm(cal?'Координаты точно привязаны? Ось DEC поедет к магниту, его положение будет сохранено':
+                  'Привязать DEC по датчику? Ось DEC поедет к магниту'))return;
+  fetch('/home-search'+(cal?'?calibrate=1':'')).then(r=>r.text()).then(t=>{if(t!='OK')alert(t);poll();});
+}
 function landmark(a){
   if(a=='sync'&&!confirm('Труба точно наведена на антенну?'))return;
   fetch('/landmark?do='+a).then(poll);
@@ -1157,7 +1317,8 @@ void setup() {
     stepperDEC.setMaxSpeed(decMaxSpeed); stepperDEC.setAcceleration(decAccel);
     // После включения монтировка считается в положении парковки (если оно
     // сохранено — её паркуют перед выключением) и запаркованной; иначе в доме.
-    EEPROM.begin(sizeof(ParkData));
+    EEPROM.begin(HALL_EEPROM_ADDR + sizeof(HallMarkData));
+    loadHallMark();
     if (loadPark()) {
         stepperRA .setCurrentPosition(parkRA);
         stepperDEC.setCurrentPosition(parkDEC);
@@ -1205,6 +1366,7 @@ void setup() {
     server.on("/sync",     HTTP_GET, handleSync);
     server.on("/landmark", HTTP_GET, handleLandmark);
     server.on("/set-home", HTTP_GET, handleSetHome);
+    server.on("/home-search", HTTP_GET, handleHomeSearch);
     server.on("/set-park", HTTP_GET, handleSetPark);
     server.on("/set-time", HTTP_GET, handleSetTime);
     server.on("/park",     HTTP_GET, handlePark);
@@ -1266,12 +1428,29 @@ void loop() {
         }
     }
 
+    // — Датчик Холла DEC: уровень должен продержаться HALL_DEBOUNCE_MS —
+    bool raw = digitalRead(DEC_HOME_PIN) == LOW;
+    if (raw != hallRaw) { hallRaw = raw; hallRawTime = now; }
+    else if (raw != hallActive && now - hallRawTime >= HALL_DEBOUNCE_MS) {
+        hallActive = raw;
+        hallEdges++;
+        double d = mechDEC();
+        if (raw) hallEnterDEC = d; else hallExitDEC = d;
+        Serial.printf("Hall DEC: %s at mech DEC %.3f\n", raw ? "magnet" : "clear", d);
+    }
+
     // — DEC: GoTo или джог. Джог механический, независимо от положения трубы:
     //   + всегда в одну сторону оси, − в другую, по кругу через полюс.
     //   Мотор DEC после остановки не выключаем, если включено удержание —
     if (decSlew) {
         if (!stepperDEC.run()) decSlew = false;
         decStopTime = now;
+    } else if (homeState != HOME_IDLE) {
+        // Поиск Home: джог (:Mn#/:Ms#) его прерывает, гидирование ждёт
+        decGuideAcc = 0; decGuideMove = false;
+        if (decManualSpeed != 0.0f) homeFail("ручное движение DEC");
+        else                        homeSearchStep();
+        decMoving = true; decStopTime = now;
     } else if (decManualSpeed != 0.0f) {
         decGuideAcc = 0; decGuideMove = false;   // джог отменяет поправки гидирования
         enableDEC(true);
@@ -1311,24 +1490,15 @@ void loop() {
         }
     }
 
-    isSlewing = raSlew || decSlew || gotoPending;
+    if (homeState == HOME_CENTER) homeSearchStep();   // доезд в 90° закончен?
+
+    isSlewing = raSlew || decSlew || gotoPending || homeState != HOME_IDLE;
 
     // — Park: оси дошли до положения парковки —
     if (parkPending && !isSlewing) {
         parkPending = false;
         isParked    = true;
         Serial.println(F("Parked"));
-    }
-
-    // — Датчик Холла DEC: уровень должен продержаться HALL_DEBOUNCE_MS —
-    bool raw = digitalRead(DEC_HOME_PIN) == LOW;
-    if (raw != hallRaw) { hallRaw = raw; hallRawTime = now; }
-    else if (raw != hallActive && now - hallRawTime >= HALL_DEBOUNCE_MS) {
-        hallActive = raw;
-        hallEdges++;
-        double d = mechDEC();
-        if (raw) hallEnterDEC = d; else hallExitDEC = d;
-        Serial.printf("Hall DEC: %s at mech DEC %.3f\n", raw ? "magnet" : "clear", d);
     }
 
     updateCurrentCoords();
@@ -1377,6 +1547,9 @@ void handleStatus() {
     j += "\"hall_in\":"    + (isnan(hallEnterDEC) ? String("null") : String(hallEnterDEC, 3)) + ",";
     j += "\"hall_out\":"   + (isnan(hallExitDEC)  ? String("null") : String(hallExitDEC,  3)) + ",";
     j += "\"mech_dec\":"   + String(mechDEC(), 3)        + ",";
+    j += "\"homing\":"     + String((int)homeState)      + ",";
+    j += "\"hall_mark\":"  + String(hallMarkDEC, 3)      + ",";
+    j += "\"home_msg\":\"" + homeMsg                     + "\",";
     j += "\"ip\":\""     + WiFi.localIP().toString() + "\"";
     j += "}";
     server.send(200, "application/json", j);
@@ -1448,6 +1621,14 @@ void handleLandmark() {
     else if (a == "goto") gotoLandmark();
     else { server.send(400, "text/plain", "do=sync|goto"); return; }
     server.send(200, "text/plain", "OK");
+}
+
+// GET /home-search[?dir=1|-1][&calibrate=1] — привязка DEC по метке датчика
+// Холла (без dir — к метке); calibrate — измерить метку и сохранить во флеш
+void handleHomeSearch() {
+    int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 0;
+    bool cal = server.arg("calibrate") == "1";
+    server.send(200, "text/plain", startHomeSearch(dir, cal) ? "OK" : homeMsg);
 }
 
 void handleSetHome() {
