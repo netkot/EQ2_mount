@@ -53,6 +53,10 @@
 #define DEC_DIR_PIN    14
 #define DEC_ENABLE_PIN 13
 
+// Датчик Холла A3144 — концевик Home по DEC (см. HALL_SENSOR_DEC_HOME.md).
+// У GPIO16 нет подтяжки к питанию: внешние 10 кОм к 3.3 V. LOW = магнит.
+#define DEC_HOME_PIN   16
+
 // ============================================================
 //  Механика
 // ============================================================
@@ -180,6 +184,15 @@ bool decMoving = false;
 // true  = мотор DEC остаётся включённым (рекомендуется если ось ослаблена).
 // false = мотор DEC отключается через MOTOR_OFF_DELAY мс (тихий режим).
 bool decHoldEnabled = true;
+
+// Датчик Холла DEC: состояние после антидребезга, число переключений
+// и механический DEC в момент последнего входа в зону и выхода из неё
+const unsigned long HALL_DEBOUNCE_MS = 5;
+bool hallActive     = false;   // true = магнит у датчика (на пине LOW)
+bool hallRaw        = false;
+unsigned long hallRawTime = 0;
+unsigned long hallEdges   = 0;
+double hallEnterDEC = NAN, hallExitDEC = NAN;
 
 // ============================================================
 //  Настройки моторов
@@ -838,6 +851,8 @@ function poll(){
       ' &nbsp;|&nbsp; <b>Parked:</b> '+(d.parked?'<span style="color:#60a5fa">YES</span>':'NO')+
       '<br><b>LST:</b> '+hms(d.lst)+' &nbsp;|&nbsp; <b>Alt:</b> '+fmt(d.alt,1)+'°'+
       ' &nbsp;|&nbsp; <b>Pier:</b> '+d.pier+
+      (d.hall!=null?' &nbsp;|&nbsp; <b>Hall:</b> '+(d.hall?'<span style="color:#10b981">MAGNET</span>':'clear')+
+        ' ('+d.hall_edges+')':'')+
       (d.time_ok?'':' &nbsp;|&nbsp; <span style="color:#f59e0b">⚠ время не задано</span>');
     if(!d.time_ok&&!timeSent){timeSent=true;fetch('/set-time?ms='+Date.now());}
     if(d.ip){
@@ -1129,6 +1144,9 @@ void setup() {
 
     pinMode(RA_ENABLE_PIN,  OUTPUT); digitalWrite(RA_ENABLE_PIN,  HIGH);
     pinMode(DEC_ENABLE_PIN, OUTPUT); digitalWrite(DEC_ENABLE_PIN, HIGH);
+    pinMode(DEC_HOME_PIN, INPUT);   // INPUT_PULLUP на GPIO16 не работает
+    hallRaw = hallActive = digitalRead(DEC_HOME_PIN) == LOW;
+    Serial.printf("Hall DEC: %s\n", hallActive ? "magnet" : "clear");
 
     tmcSerial.begin(TMC_BAUD, SWSERIAL_8N1, TMC_UART_PIN, TMC_UART_PIN, false);
     raDrvOk  = tmcInit(drvRA,  "RA",  RA_CURRENT_MA);
@@ -1302,6 +1320,17 @@ void loop() {
         Serial.println(F("Parked"));
     }
 
+    // — Датчик Холла DEC: уровень должен продержаться HALL_DEBOUNCE_MS —
+    bool raw = digitalRead(DEC_HOME_PIN) == LOW;
+    if (raw != hallRaw) { hallRaw = raw; hallRawTime = now; }
+    else if (raw != hallActive && now - hallRawTime >= HALL_DEBOUNCE_MS) {
+        hallActive = raw;
+        hallEdges++;
+        double d = mechDEC();
+        if (raw) hallEnterDEC = d; else hallExitDEC = d;
+        Serial.printf("Hall DEC: %s at mech DEC %.3f\n", raw ? "magnet" : "clear", d);
+    }
+
     updateCurrentCoords();
     lxHandleTCP();
 }
@@ -1342,6 +1371,12 @@ void handleStatus() {
     j += "\"rssi\":"     + String(WiFi.RSSI())             + ",";
     j += "\"heap\":"     + String(ESP.getFreeHeap())       + ",";
     j += "\"heap_max\":" + String(ESP.getMaxFreeBlockSize()) + ",";
+    j += "\"hall\":"       + String(hallActive ? 1 : 0)  + ",";
+    j += "\"hall_raw\":"   + String(digitalRead(DEC_HOME_PIN) == LOW ? 1 : 0) + ",";
+    j += "\"hall_edges\":" + String(hallEdges)           + ",";
+    j += "\"hall_in\":"    + (isnan(hallEnterDEC) ? String("null") : String(hallEnterDEC, 3)) + ",";
+    j += "\"hall_out\":"   + (isnan(hallExitDEC)  ? String("null") : String(hallExitDEC,  3)) + ",";
+    j += "\"mech_dec\":"   + String(mechDEC(), 3)        + ",";
     j += "\"ip\":\""     + WiFi.localIP().toString() + "\"";
     j += "}";
     server.send(200, "application/json", j);
